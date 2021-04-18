@@ -1,4 +1,6 @@
 # A Tool for Morphological Inflection
+This is a private fork of [https://github.com/antonisa/inflection](https://github.com/antonisa/inflection)
+
 
 This is the code accompanying our paper on ["Pushing the Limits of Low-Resource Morphological Inflection".](https://arxiv.org/pdf/1908.05838.pdf)
 

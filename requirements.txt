@@ -1,4 +1,3 @@
-python>=2.7
-dynet==2.0.3
+dynet
 numpy
 matplotlib
