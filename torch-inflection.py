@@ -1,10 +1,7 @@
-# -*- coding: utf-8 -*-
-import logging
 import argparse
 import codecs
-import dynet as dy
 import matplotlib
-
+import dynet as dy
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import myutil
@@ -12,15 +9,21 @@ import numpy as np
 from operator import itemgetter
 import os, sys
 from random import random, shuffle
+import logging
+import torch
+import torch.utils.data as data
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--datapath", help="path to data", type=str, required=True)
 parser.add_argument("--L1", help="transfer languages (split with comma for multiple ones)", type=str, required=False)
 parser.add_argument("--L2", help="test languages", type=str, required=True)
 parser.add_argument("--mode", help="usage mode", type=str,
-                    choices=['train', 'test', 'test-dev', 'draw-dev', 'test-dev-ensemble', 'test-ensemble',
-                             'test-two-ensemble', 'test-three-ensemble',
-                             'test-all-ensemble'], default='', required=True)
+                    choices=['train', 'test',
+                             # 'test-dev', 'draw-dev', 'test-dev-ensemble', 'test-ensemble',
+                             # 'test-two-ensemble', 'test-three-ensemble',
+                             # 'test-all-ensemble'
+                             ],
+                    default='', required=True)
 parser.add_argument("--setting", help="data setting", type=str, choices=['original', 'swap', 'low', ], default='original')
 parser.add_argument("--modelpath", help="path to store the models", type=str, default='./models')
 parser.add_argument("--figurepath", help="path to store the output attention figures", type=str, default='./figures')
@@ -39,6 +42,7 @@ parser.add_argument("--use_tag_att_reg", help="use attention regularization on t
 parser.add_argument("--dynet-mem", help="set dynet memory", default=800, type=int, required=False)
 parser.add_argument("--dynet-autobatch", help="use dynet autobatching (def: 1)", default=1, type=int, required=False)
 args = parser.parse_args()
+
 
 if args.L1:
     L1 = args.L1
@@ -98,20 +102,6 @@ if args.mode == "train":
     TRAIN = True
 elif args.mode == "test":
     TEST = True
-elif args.mode == "test-dev":
-    TEST_DEV = True
-elif args.mode == "draw-dev":
-    DRAW_DEV = True
-elif args.mode == "test-dev-ensemble":
-    TEST_DEV_ENSEMBLE = True
-elif args.mode == "test-ensemble":
-    TEST_ENSEMBLE = True
-elif args.mode == "test-two-ensemble":
-    TEST_TWO_ENSEMBLE = True
-elif args.mode == "test-three-ensemble":
-    TEST_THREE_ENSEMBLE = True
-elif args.mode == "test-all-ensemble":
-    TEST_ALL_ENSEMBLE = True
 
 USE_HALL = False
 if args.use_hall:
@@ -123,18 +113,6 @@ if args.only_hall:
 
 if args.setting == "original":
     ORIGINAL = True
-    SWAP = False
-    LOW = False
-elif args.setting == "swap":
-    ORIGINAL = False
-    SWAP = True
-    LOW = False
-elif args.setting == "low":
-    ORIGINAL = False
-    SWAP = False
-    LOW = True
-else:
-    ORIGINAL = False
     SWAP = False
     LOW = False
 
@@ -324,6 +302,7 @@ else:
         characters.append(u' ')
     tags = myutil.read_vocab(os.path.join(MODEL_DIR, MODEL_NAME + "tag.vocab"))
 
+# TODO: we could put the PAD character here
 int2char = list(characters)
 char2int = {c: i for i, c in enumerate(characters)}
 
@@ -357,6 +336,90 @@ def run_lstm(init_state, input_vecs):
     return out_vectors
 
 
+class InflectionModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.enc_blstm = torch.nn.LSTM(input_size=EMBEDDINGS_SIZE, hidden_size=STATE_SIZE,
+                                       num_layers=LSTM_NUM_OF_LAYERS, bidirectional=True)
+        self.dec_lstm = torch.nn.LSTM(input_size=STATE_SIZE * 3 + EMBEDDINGS_SIZE, hidden_size=STATE_SIZE,
+                                      num_layers=LSTM_NUM_OF_LAYERS, bidirectional=False)
+        # TODO: embeddings have to add padding_idx if it's added
+        self.input_lookup = torch.nn.Embedding(VOCAB_SIZE, EMBEDDINGS_SIZE)
+        self.tag_input_lookup = torch.nn.Embedding(TAG_VOCAB_SIZE, EMBEDDINGS_SIZE)
+        self.attn_w1 = torch.nn.Linear(STATE_SIZE * 2, ATTENTION_SIZE, bias=False)
+        self.attn_w2 = torch.nn.Linear(STATE_SIZE * 2 * LSTM_NUM_OF_LAYERS, ATTENTION_SIZE, bias=False)
+        self.attn_w3 = torch.nn.Linear(5, ATTENTION_SIZE, bias=False)
+        self.attn_v = torch.nn.Linear(ATTENTION_SIZE, 1, bias=False)
+
+        self.decoder = self.nn.Linear(STATE_SIZE, VOCAB_SIZE)
+        self.output_lookup = self.input_lookup
+
+        self.enc_tag_lstm = torch.nn.LSTM(input_size=EMBEDDINGS_SIZE, hidden_size=STATE_SIZE,
+                                          num_layers=LSTM_NUM_OF_LAYERS, bidirectional=False)
+        self.tag_attn_w1 = torch.nn.Linear(STATE_SIZE, ATTENTION_SIZE, bias=False)
+        self.tag_attn_w2 = torch.nn.Linear(STATE_SIZE * 2 * LSTM_NUM_OF_LAYERS, ATTENTION_SIZE, bias=False)
+        self.tag_attn_v = torch.nn.Linear(STATE_SIZE, ATTENTION_SIZE, bias=False)
+
+        if PREDICT_LANG:
+            self.lang_class_w = torch.nn.Linear(NUM_LANG, 2 * STATE_SIZE, bias=False)
+
+    def embed_tags(self, tags_list):
+        """
+        param:
+        tags_list: is a list of list of tags. batched basically.
+        return (B, L, D)
+        """
+        int_tags = [[tag2int[t] for t in tags] for tags in tags_list]
+        return torch.stack([torch.stack([self.tag_input_lookup[tag] for tag in tags]) for tags in int_tags])
+
+    def embed_sentence(self, sentences):
+        """
+        return (B, L, D) sentences. currently (1, L, D)
+        """
+        # TODO: need to pad for bigger batch size than 1. currently no support for padding
+        sentences = [[EOS] + list(sentence) + [EOS] for sentence in sentences]
+        sentences = [[char2int[c] for c in sentence] for sentence in sentences]
+        return torch.stack([torch.stack([self.input_lookup[char] for char in sentence]) for sentence in sentences])
+
+    def self_encode_tags(self, tags):
+        """
+        tags: (B, L, D)
+        """
+        vectors, _ = self.enc_tag_lstm(torch.transpose(tags, 0, 1))  # needs (L, B, D)
+        # (L, B, S * 1)
+        vectors = vectors.transpose(0, 1)
+        # (B, L, S)
+        unnormalized = torch.matmul(vectors, vectors.transpose(1, 2))
+        # (B, L, L)
+        self_att_weights = torch.softmax(unnormalized, dim=-1)
+        # (B, L, L)
+        to_add = torch.matmul(vectors.transpose(1, 2), self_att_weights).transpose(1, 2)
+        # (B, L, S)
+        return vectors + to_add
+
+    def encode_sentence(self, sentence):
+        """
+        sentence: (B, L, D) hopefully a packed padded sequence
+        """
+        vectors, _ = self.enc_blstm(sentence.transpose(0, 1))
+        return vectors.transpose(0, 1)
+        # (B, L, 2S)
+
+    def attend_tags(self, state, w1dt):
+        # input_mat: (encoder_state x seqlen) => input vecs concatenated as cols
+        # w1dt: (attdim x seqlen)
+        # w2dt: (attdim x attdim)
+        # state: (B, D, L)
+        # w2dt = self.tag_attention_w2 * state
+        # att_weights: (seqlen,) row vector
+        unnormalized = dy.transpose(self.tag_attention_v * dy.tanh(dy.colwise_add(w1dt, w2dt)))
+        att_weights = dy.softmax(unnormalized)
+        # context: (encoder_state)
+
+        return att_weights
+
+
+
 class InflectionModel:
     def __init__(self):
         self.model = dy.Model()
@@ -388,6 +451,7 @@ class InflectionModel:
             # self.lang_class_w = self.model.add_parameters((STATE_SIZE*2, 1))
 
     def embed_tags(self, tags):
+        # print(tags)
         tags = [tag2int[t] for t in tags]
         return [self.tag_input_lookup[tag] for tag in tags]
 
@@ -399,17 +463,18 @@ class InflectionModel:
     def self_encode_tags(self, tags):
         vectors = tags
         # Self attention for every tag:
-        vectors = run_lstm(self.enc_tag_lstm.initial_state(), tags)
+        vectors = run_lstm(self.enc_tag_lstm.initial_state(), vectors)
         tag_input_mat = dy.concatenate_cols(vectors)
-        # print(tag_input_mat.dim())
+        # (S, L)
         out_vectors = []
         for v1 in vectors:
             # tag input mat: [tag_emb x seqlen]
             # v1: [tag_emb]
             unnormalized = dy.transpose(dy.transpose(v1) * tag_input_mat)
+            # 1, seq_len
             self_att_weights = dy.softmax(unnormalized)
             to_add = tag_input_mat * self_att_weights
-            out_vectors.append(v1 + tag_input_mat * self_att_weights)
+            out_vectors.append(v1 + to_add)
         return out_vectors
 
     def encode_tags(self, tags):
@@ -418,19 +483,22 @@ class InflectionModel:
 
     def encode_sentence(self, sentence):
         sentence_rev = list(reversed(sentence))
-
         fwd_vectors = run_lstm(self.enc_fwd_lstm.initial_state(), sentence)
+        # list of S
         bwd_vectors = run_lstm(self.enc_bwd_lstm.initial_state(), sentence_rev)
+        # list of S
         bwd_vectors = list(reversed(bwd_vectors))
+        # list of S size each, now in the order of the sentence
         vectors = [dy.concatenate(list(p)) for p in zip(fwd_vectors, bwd_vectors)]
-
         return vectors
+        # list of 2S size each, length of the list is length of the sequence
+        # S is state size
 
     def attend_tags(self, state, w1dt):
-
         # input_mat: (encoder_state x seqlen) => input vecs concatenated as cols
         # w1dt: (attdim x seqlen)
         # w2dt: (attdim x attdim)
+        print(state.dim())
         w2dt = self.tag_attention_w2 * state
         # att_weights: (seqlen,) row vector
         unnormalized = dy.transpose(self.tag_attention_v * dy.tanh(dy.colwise_add(w1dt, w2dt)))
@@ -466,7 +534,7 @@ class InflectionModel:
 
         N = len(vectors)
 
-        input_mat = dy.concatenate_cols(vectors)  # (2, S, L)
+        input_mat = dy.concatenate_cols(vectors)
         w1dt = None
 
         input_mat = dy.dropout(input_mat, DROPOUT_PROB)
@@ -495,11 +563,11 @@ class InflectionModel:
             tag_context = tag_input_mat * tag_att_weights
 
             tag_context2 = dy.concatenate([tag_context, tag_context])
-            # print(tag_context2.dim())
+
             new_state = state + tag_context2
 
             att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
-            context = input_mat * att_weights
+            # context = input_mat * att_weights
             best_ic = np.argmax(att_weights.vec_value())
             context = input_mat * att_weights
             startt = min(best_ic - 2, N - 6)
@@ -879,222 +947,14 @@ class InflectionModel:
     def get_loss(self, input_sentence, input_tags, output_sentence, lang_id, weight=1, tf_prob=1.0):
         embedded = self.embed_sentence(input_sentence)
         encoded = self.encode_sentence(embedded)
+        # input is passed through the lemma encoder - which is a bi-lstm
+
         # encoded = dy.dropout(encoded, DROPOUT_PROB)
         embedded_tags = self.embed_tags(input_tags)
         # encoded_tags = self.encode_tags(enc_tag_lstm, embedded_tags)
         encoded_tags = self.self_encode_tags(embedded_tags)
 
         return self.decode(encoded, encoded_tags, output_sentence, lang_id, weight, tf_prob)
-
-
-def ensemble_generate_nbest(inf_models, ensemble_weights, in_seq, tag_seq, beam_size=4):
-    dy.renew_cg()
-    n_models = len(inf_models)
-    embedded = {}
-    encoded = {}
-    embedded_tags = {}
-    encoded_tags = {}
-    input_mat = {}
-    tag_input_mat = {}
-    prev_att = {}
-    for i in range(n_models):
-        embedded[i] = inf_models[i].embed_sentence(in_seq)
-        encoded[i] = inf_models[i].encode_sentence(embedded[i])
-        embedded_tags[i] = inf_models[i].embed_tags(tag_seq)
-        # encoded_tags[i] = inf_models[i].encode_tags(embedded_tags[i])
-        encoded_tags[i] = inf_models[i].self_encode_tags(embedded_tags[i])
-        input_mat[i] = dy.concatenate_cols(encoded[i])
-        tag_input_mat[i] = dy.concatenate_cols(encoded_tags[i])
-        prev_att[i] = dy.zeros(5)
-
-    tmpinseq = [EOS] + list(in_seq) + [EOS]
-    N = len(tmpinseq)
-
-    last_output_embeddings = {}
-    init_vector = {}
-    s_0 = {}
-    w1dt = {}
-    tag_w1dt = {}
-    for i in range(n_models):
-        last_output_embeddings[i] = inf_models[i].output_lookup[char2int[EOS]]
-        init_vector[i] = dy.concatenate([encoded[i][-1], encoded_tags[i][-1], last_output_embeddings[i]])
-        s_0[i] = inf_models[i].dec_lstm.initial_state().add_input(init_vector[i])
-        w1dt[i] = inf_models[i].attention_w1 * input_mat[i]
-        tag_w1dt[i] = inf_models[i].tag_attention_w1 * tag_input_mat[i]
-
-    beam = {0: [(0, [s_0[i].s() for i in range(n_models)], [], [prev_att[i] for i in range(n_models)])]}
-
-    i = 1
-
-    nbest = []
-    # we'll need this
-    last_states = {}
-
-    MAX_PREDICTION_LEN = max(len(in_seq) * 1.5, MAX_PREDICTION_LEN_DEF)
-
-    # expand another step if didn't reach max length and there's still beams to expand
-    while i < MAX_PREDICTION_LEN and len(beam[i - 1]) > 0:
-        # create all expansions from the previous beam:
-        next_beam_id = []
-        for hyp_id, hypothesis in enumerate(beam[i - 1]):
-            # expand hypothesis tuple
-            # prefix_seq, prefix_prob, prefix_decoder, prefix_context, prefix_tag_context = hypothesis
-            prefix_prob, prefix_decoders, prefix_seq, prefix_atts = hypothesis
-
-            if i > 1:
-                last_hypo_symbol = prefix_seq[-1]
-            else:
-                last_hypo_symbol = EOS
-
-            # cant expand finished sequences
-            if last_hypo_symbol == EOS and i > 3:
-                continue
-            # expand from the last symbol of the hypothesis
-            last_output_embeddings = {}
-            for k in range(n_models):
-                last_output_embeddings[k] = inf_models[k].output_lookup[char2int[last_hypo_symbol]]
-
-            # Perform the forward step on the decoder
-            # First, set the decoder's parameters to what they were in the previous step
-            s = {}
-            if (i == 1):
-                for k in range(n_models):
-                    s[k] = inf_models[k].dec_lstm.initial_state().add_input(init_vector[k])
-            else:
-                for k in range(n_models):
-                    s[k] = inf_models[k].dec_lstm.initial_state(prefix_decoders[k])
-
-            s_0 = {}
-            probs = {}
-            state = {}
-            tag_att_weights = {}
-            tag_context = {}
-            tag_context2 = {}
-            new_state = {}
-            att_weights = {}
-            prev_att2 = {}
-            context = {}
-            vector = {}
-            out_vector = {}
-            for k in range(n_models):
-                state[k] = dy.concatenate(list(s[k].s()))
-                tag_att_weights[k] = inf_models[k].attend_tags(state[k], tag_w1dt[k])
-                tag_context[k] = tag_input_mat[k] * tag_att_weights[k]
-                tag_context2[k] = dy.concatenate([tag_context[k], tag_context[k]])
-                new_state[k] = state[k] + tag_context2[k]
-
-                att_weights[k] = inf_models[k].attend_with_prev(new_state[k], w1dt[k], prefix_atts[k])
-                best_ic = np.argmax(att_weights[k].vec_value())
-                startt = min(best_ic - 2, N - 6)
-                if startt < 0:
-                    startt = 0
-                endd = startt + 5
-                if N < 5:
-                    prev_att2[k] = dy.concatenate([att_weights[k]] + [dy.zeros(1)] * (5 - N))
-                else:
-                    prev_att2[k] = att_weights[k][startt:endd]
-                if prev_att2[k].dim()[0][0] != 5:
-                    print(prev_att2[k].dim())
-                context[k] = input_mat[k] * att_weights[k]
-
-                vector[k] = dy.concatenate([context[k], tag_context[k], last_output_embeddings[k]])
-                s_0[k] = s[k].add_input(vector[k])
-                out_vector[k] = inf_models[k].decoder_w * s_0[k].output() + inf_models[k].decoder_b
-
-                probs[k] = dy.softmax(out_vector[k]).npvalue()
-
-                # Add length norm
-                length_norm = np.power(5 + i, LENGTH_NORM_WEIGHT) / (np.power(6, LENGTH_NORM_WEIGHT))
-                probs[k] = probs[k] / length_norm
-
-                if k == 0:
-                    last_states[hyp_id] = []
-                last_states[hyp_id].append(s_0[k].s())
-
-            # Combine the ensemble probabilities
-            ensemble_probs = probs[0]
-            for k in range(1, n_models):
-                ensemble_probs += probs[k]
-            # find best candidate outputs
-            n_best_indices = myutil.argmax(ensemble_probs, beam_size)
-            for index in n_best_indices:
-                this_score = prefix_prob + np.log(ensemble_probs[index] / float(n_models))
-                next_beam_id.append((this_score, hyp_id, index, [prev_att2[k] for k in range(n_models)]))
-            next_beam_id.sort(key=itemgetter(0), reverse=True)
-            next_beam_id = next_beam_id[:beam_size]
-
-        # Create the most probable hypotheses
-        # add the most probable expansions from all hypotheses to the beam
-        new_hypos = []
-        for item in next_beam_id:
-            hypid = item[1]
-            this_prob = item[0]
-            char_id = item[2]
-            next_sentence = beam[i - 1][hypid][2] + [int2char[char_id]]
-            new_hyp = (this_prob, last_states[hypid], next_sentence, item[3])
-            new_hypos.append(new_hyp)
-            if next_sentence[-1] == EOS or i == MAX_PREDICTION_LEN - 1:
-                if ''.join(next_sentence) != "<EOS>" and ''.join(next_sentence) != "<EOS><EOS>" and ''.join(
-                        next_sentence) != "<EOS><EOS><EOS>":
-                    nbest.append(new_hyp)
-
-        beam[i] = new_hypos
-        i += 1
-        if len(nbest) > 0:
-            nbest.sort(key=itemgetter(0), reverse=True)
-            nbest = nbest[:beam_size]
-        if len(nbest) == beam_size and (len(new_hypos) == 0 or (nbest[-1][0] >= new_hypos[0][0])):
-            break
-
-    return nbest
-
-
-def test_beam_ensemble(inf_models, weights, beam_size=4, fn=None):
-    ks = list(range(len(test_i)))
-    with codecs.open(fn, 'w', 'utf-8') as outf:
-        for j, k in enumerate(ks):
-            out = ensemble_generate_nbest(inf_models, weights, test_i[k], test_t[k], beam_size)
-            if len(out):
-                word = ''.join([c for c in out[0][2] if c != EOS])
-                out1 = ''.join(out[0][2][1:-1])
-            elif out:
-                word = ''.join([c for c in out[0][2] if c != EOS])
-            else:
-                print("no out")
-                word = ''.join(test_i[k])
-            outf.write(''.join(test_i[k]) + '\t' + word + '\t' + ';'.join(test_t[k]) + '\n')
-
-    return
-
-
-def eval_dev_beam_ensemble(inf_models, weights, beam_size=4, K=100, epoch=0):
-    if K == "all":
-        K = len(dev_i)
-    ks = list(range(len(dev_i)))
-    shuffle(ks)
-    ks = ks[:K]
-    outs = []
-    levs = []
-    correct = 0.0
-    for j, k in enumerate(ks):
-        out = ensemble_generate_nbest(inf_models, weights, dev_i[k], dev_t[k], beam_size)
-        if len(out):
-            word = ''.join([c for c in out[0][2] if c != EOS])
-            out1 = ''.join(out[0][2][1:-1])
-        elif out:
-            word = ''.join([c for c in out[0][2] if c != EOS])
-        else:
-            print("no out")
-            word = ''.join(dev_i[k])
-        outs.append(word)
-        lev = myutil.edit_distance(word, dev_o[k])
-        levs.append(lev)
-        if list(out1) == dev_o[k]:
-            correct += 1
-
-    accuracy = correct / float(K)
-    avg_edit = np.average(np.array(levs))
-    return accuracy, avg_edit
 
 
 def test_beam(inf_model, beam_size=4, fn=None):
@@ -1119,36 +979,6 @@ def draw_decode(inf_model, K=20):
     for k in range(K):
         filename = os.path.join(FIGURE_DIR, str(k))
         inf_model.draw_decode(dev_i[k], dev_t[k], dev_o[k], show_att=True, show_tag_att=True, fn=filename)
-    return
-
-
-def eval_dev_beam(inf_model, beam_size=4, K=100, epoch=0):
-    if K == "all":
-        K = len(dev_i)
-    ks = list(range(len(dev_i)))
-    shuffle(ks)
-    ks = ks[:K]
-    outs = []
-    levs = []
-    correct = 0.0
-    for j, k in enumerate(ks):
-        out = inf_model.generate_nbest(dev_i[k], dev_t[k], beam_size)
-        if len(out):
-            word = ''.join([c for c in out[0][2] if c != EOS])
-            out1 = ''.join(out[0][2][1:-1])
-        elif out:
-            word = ''.join([c for c in out[0][2] if c != EOS])
-        else:
-            word = ''.join(dev_i[k])
-        outs.append(word)
-        lev = myutil.edit_distance(word, dev_o[k])
-        levs.append(lev)
-        if list(out1) == dev_o[k]:
-            correct += 1
-
-    accuracy = correct / float(K)
-    avg_edit = np.average(np.array(levs))
-    return accuracy, avg_edit
 
 
 def eval_dev_greedy(inf_model, K=100, epoch=0):
@@ -1235,11 +1065,18 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 else:
                     return outputs[j], tags[j], outputs[j], lang_ids[j]
 
-            pairs_io = map(lambda x: index_task_to_io(*x), burnin_pairs)
-            # for j, t in burnin_pairs:
-            for (inp, tag, otpt, lang_id) in pairs_io:
+            pairs_io = list(map(lambda x: index_task_to_io(*x), burnin_pairs))
+
+            for example in data.BatchSampler(pairs_io, 1, drop_last=False):
                 # task 0 is copy input
-                loss = inf_model.get_loss(inp, tag, otpt, lang_id)
+                # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
+                example = (list(map(lambda x: x[0], example)), # input
+                           list(map(lambda x: x[1], example)), # tag
+                           list(map(lambda x: x[2], example)), # output
+                           list(map(lambda x: x[3], example))) # lang_id
+                print(example)
+                loss = 0
+                exit(1)
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE:
                     loss = dy.esum(batch) / len(batch)
@@ -1249,11 +1086,11 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     batch = []
                     dy.renew_cg()
             if batch:
+                print(batch)
                 loss = dy.esum(batch) / len(batch)
                 total_loss += loss.value()
                 loss.backward()
                 trainer.update()
-                # batch = []
                 dy.renew_cg()
             if i % 1 == 0:
                 trainer.status()
@@ -1503,7 +1340,6 @@ if TRAIN:
 
     else:
         if ORIGINAL or SWAP:
-            # print("bnfdkjbekrwjfnjletnrfgnernncfvoenrtjgvnertjngjkt4nfgnh")
             trainer, best_acc, best_edd = train_simple_attention_with_tags(inflection_model, MULTIPLY * low_i + high_i,
                                                                            MULTIPLY * low_t + high_t,
                                                                            MULTIPLY * low_o + high_o)
@@ -1522,32 +1358,6 @@ if TRAIN:
             print("Best dev accuracy after finetuning: ", best_acc)
             print("Best dev lev distance after finetuning: ", best_edd)
 
-
-elif TEST_DEV:
-    inflection_model = InflectionModel()
-    inflection_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
-    # acc, edd = eval_dev_greedy(enc_fwd_lstm, enc_bwd_lstm, dec_lstm, "all", "test")
-    acc, edd = eval_dev_beam(inflection_model, 8, "all", "test")  # it was 8 beams
-    print("Best dev accuracy at test: ", acc)
-    print("Best dev lev distance at test: ", edd)
-
-elif DRAW_DEV:
-    inflection_model = InflectionModel()
-    inflection_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
-    draw_decode(inflection_model)
-
-
-elif TEST_DEV_ENSEMBLE:
-    inflection_model1 = InflectionModel()
-    inflection_model1.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
-    inflection_model2 = InflectionModel()
-    inflection_model2.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
-    acc, edd = eval_dev_beam_ensemble([inflection_model1, inflection_model2], [0.5, 0.5], 8, "all", "test")
-    print("Best dev accuracy at test: ", acc)
-    print("Best dev lev distance at test: ", edd)
-
-
-
 elif TEST:
     inflection_model = InflectionModel()
     inflection_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
@@ -1555,51 +1365,3 @@ elif TEST:
         test_beam(inflection_model, 8, args.outputfile)
     else:
         test_beam(inflection_model, 8, os.path.join(OUTPUT_DIR, MODEL_NAME + "test.output"))
-
-
-elif TEST_ENSEMBLE:
-    inflection_model1 = InflectionModel()
-    inflection_model1.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
-    inflection_model2 = InflectionModel()
-    inflection_model2.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
-    inflection_model3 = InflectionModel()
-    inflection_model3.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
-    test_beam_ensemble([inflection_model1, inflection_model2, inflection_model3], [0.34, 0.33, 0.33], 8,
-                       os.path.join(OUTPUT_DIR, MODEL_NAME + "test.ensemble.output"))
-
-
-elif TEST_TWO_ENSEMBLE:
-    mixing_weights = compute_mixing_weights(2)
-    inflection_model1 = InflectionModel()
-    inflection_model1.model.populate(os.path.join(MODEL_DIR, "orig.acc.model"))
-    inflection_model2 = InflectionModel()
-    inflection_model2.model.populate(os.path.join(MODEL_DIR, "swap.acc.model"))
-    test_beam_ensemble([inflection_model1, inflection_model2], mixing_weights, 8,
-                       os.path.join(OUTPUT_DIR, "test.two_ensemble.output"))
-
-
-
-elif TEST_THREE_ENSEMBLE:
-    mixing_weights = compute_mixing_weights(3)
-    inflection_model1 = InflectionModel()
-    inflection_model1.model.populate(os.path.join(MODEL_DIR, "orig.acc.model"))
-    inflection_model2 = InflectionModel()
-    inflection_model2.model.populate(os.path.join(MODEL_DIR, "swap.acc.model"))
-    inflection_model3 = InflectionModel()
-    inflection_model3.model.populate(os.path.join(MODEL_DIR, "low.both.model"))
-    test_beam_ensemble([inflection_model1, inflection_model2, inflection_model3], mixing_weights, 8,
-                       os.path.join(OUTPUT_DIR, "test.three_ensemble.output"))
-
-
-elif TEST_ALL_ENSEMBLE:
-    mixing_weights = compute_mixing_weights(2)
-    inflection_model1 = InflectionModel()
-    inflection_model1.model.populate(os.path.join(MODEL_DIR, "orig.acc.model"))
-    inflection_model2 = InflectionModel()
-    inflection_model2.model.populate(os.path.join(MODEL_DIR, "swap.acc.model"))
-    inflection_model3 = InflectionModel()
-    inflection_model3.model.populate.path.join((MODEL_DIR, "orig.edd.model"))
-    inflection_model4 = InflectionModel()
-    inflection_model4.model.populate(os.path.join(MODEL_DIR, "swap.edd.model"))
-    test_beam_ensemble([inflection_model1, inflection_model2, inflection_model3, inflection_model4],
-                       mixing_weights + mixing_weights, 8, os.path.join(OUTPUT_DIR, "test.all_ensemble.output"))
