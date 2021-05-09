@@ -476,7 +476,7 @@ class InflectionModel:
 
         last_output_embeddings = self.output_lookup[char2int[EOS]]
         temp = dy.concatenate([vectors[-1], tag_vectors[-1], last_output_embeddings])
-        print(f"temp {temp.dim()}")
+        # print(f"temp {temp.dim()}")
         s = self.dec_lstm.initial_state().add_input(temp)
         loss = []
         prev_att = dy.zeros(5)

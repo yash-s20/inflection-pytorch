@@ -452,10 +452,6 @@ class InflectionModule(torch.nn.Module):
         w2dt = self.attn_w2(state)
         w3dt = self.attn_w3(prev_att)
         # att_weights: (seqlen,) row vector
-        # print(w1dt.shape)
-        # print(w2dt.shape)
-        # print(w3dt.shape)
-        # print(self.attn_v)
         unnormalized = self.attn_v(torch.tanh(w1dt + w2dt + w3dt))
         att_weights = torch.softmax(unnormalized, dim=1)
         # (B, L, 1)
@@ -917,7 +913,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                            list(map(lambda x: x[1], example)), # tag
                            list(map(lambda x: x[2], example)), # output
                            list(map(lambda x: x[3], example))) # lang_id
-                print(example)
+                # print(example)
                 # loss = 0
                 loss = inf_model(*example)
                 # exit(1)
@@ -925,6 +921,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / len(batch)
                     total_loss += loss.item()
+                    print(loss.item())
                     loss.backward()
                     trainer.step()
                     batch = []
@@ -937,7 +934,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 trainer.step()
                 trainer.zero_grad()
             if i % 1 == 0:
-                trainer.status()
+                # trainer.status()
                 print("Epoch " + str(i) + " : " + str(total_loss))
                 acc, edd = eval_dev_copy_greedy(inf_model, 'all', i)
                 print("\t COPY Accuracy: " + str(acc) + " average edit distance: " + str(edd))
@@ -1004,7 +1001,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     trainer.zero_grad()
                     weight = 0.0
             if i % 1 == 0:
-                trainer.status()
+                # trainer.status()
                 print("Epoch ", i, " : ", total_loss)
                 acc, edd = eval_dev_copy_greedy(inf_model, 20, 100 + i)
                 print("\t COPY Accuracy: ", acc, " average edit distance: ", edd)
