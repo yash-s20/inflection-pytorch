@@ -925,10 +925,10 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             for example in data.BatchSampler(pairs_io, 1, drop_last=False):
                 # task 0 is copy input
                 # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
-                example = (list(map(lambda x: x[0], example)), # input
-                           list(map(lambda x: x[1], example)), # tag
-                           list(map(lambda x: x[2], example)), # output
-                           list(map(lambda x: x[3], example))) # lang_id
+                example = (list(map(lambda x: x[0], example)),  # input
+                           list(map(lambda x: x[1], example)),  # tag
+                           list(map(lambda x: x[2], example)),  # output
+                           list(map(lambda x: x[3], example)))  # lang_id
                 # print(example)
                 # loss = 0
                 loss = inf_model(*example)
@@ -955,15 +955,15 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 acc, edd = eval_dev_copy_greedy(inf_model, 'all', i)
                 print("\t COPY Accuracy: " + str(acc) + " average edit distance: " + str(edd))
             if edd < prev_edd:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
             if (acc > prev_acc and edd < prev_edd) or (acc >= prev_acc and edd < prev_edd) or (
                     acc > prev_acc and edd <= prev_edd):
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
                 epochs_since_improv = 0
             else:
                 epochs_since_improv += 1
             if acc > prev_acc:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
                 epochs_since_improv = 0
             if acc > prev_acc:
                 prev_acc = acc
@@ -977,7 +977,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     break
                 trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
-                inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if acc > COPY_THRESHOLD:
                 print("Accuracy good enough, breaking")
                 break
