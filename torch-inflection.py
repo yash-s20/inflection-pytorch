@@ -538,9 +538,13 @@ class InflectionModule(torch.nn.Module):
             if teacher_prob == 1.:
                 last_output_embeddings = self.output_lookup(torch.tensor([char]))
             else:
-                raise NotImplementedError()
+                if random.random() > teacher_prob:
+                    out_char = torch.argmax(probs)
+                    last_output_embeddings = self.output_lookup(torch.tensor([out_char]))
+                else:
+                    last_output_embeddings = self.output_lookup(torch.tensor([char]))
             loss.append(-torch.log(probs[char]))
-        loss = sum(loss) * weight
+        loss = torch.sum(torch.stack(loss) * torch.tensor(weight, dtype=torch.float))
         if PREDICT_LANG:
             raise NotImplementedError()
 
@@ -570,10 +574,10 @@ class InflectionModule(torch.nn.Module):
         tmpinseq = [EOS] + list(in_seq) + [EOS]
         N = len(tmpinseq)
 
-        last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS] for _ in range(1)]))
+        last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS]]))
         _, (h_n, c_n) = self.dec_lstm(torch.cat([encoded[:, -1, :],
                                                 encoded_tags[:, -1, :],
-                                                last_output_embeddings]))
+                                                last_output_embeddings], dim=1).unsqueeze(0))
         out = ''
         batch_size = 1
         count_EOS = 0
@@ -582,8 +586,8 @@ class InflectionModule(torch.nn.Module):
         if show_tag_att:
             ttt_weights = []
         for i in range(len(in_seq) * 2):
-            w1dt = w1dt or self.attn_w1(input_mat)
-            tag_w1dt = tag_w1dt or self.tag_attn_w1(tag_input_mat)
+            w1dt = w1dt if w1dt is not None else self.attn_w1(input_mat)
+            tag_w1dt = tag_w1dt if tag_w1dt is not None else self.tag_attn_w1(tag_input_mat)
             state = torch.cat((h_n, c_n), dim=-1).squeeze(0)
             tag_att_weights = self.attend_tags(state, tag_w1dt)
             tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
@@ -591,7 +595,7 @@ class InflectionModule(torch.nn.Module):
             # (B, D)
             tag_context2 = torch.cat([tag_context, tag_context], dim=-1)
             # (B, 2D)
-            new_state = state + tag_context
+            new_state = state + tag_context2
 
             att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
 
@@ -615,7 +619,7 @@ class InflectionModule(torch.nn.Module):
             if show_tag_att:
                 ttt_weights.append(tag_att_weights)
 
-            vector = torch.cat([context, tag_context, last_output_embeddings])
+            vector = torch.cat([context, tag_context, last_output_embeddings], dim=1)
             s_out, (h_n, c_n) = self.dec_lstm(vector.unsqueeze(0), (h_n, c_n))
             s_out = s_out.squeeze(0)
             # (B, STATE_SIZE)
@@ -677,8 +681,8 @@ class InflectionModule(torch.nn.Module):
         tmpinseq = [EOS] + list(in_seq) + [EOS]
         N = len(tmpinseq)
 
-        last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS] for _ in range(1)]))
-        init_vector = torch.cat([encoded[-1], encoded_tags[-1], last_output_embeddings]).unsqueeze(0)
+        last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS]]))
+        init_vector = torch.cat([encoded[:, -1, :], encoded_tags[:, -1, :], last_output_embeddings], dim=1).unsqueeze(0)
         s_0, (h_n, c_n) = self.dec_lstm(init_vector)
         w1dt = self.attn_w1(input_mat)
 
@@ -736,13 +740,14 @@ class InflectionModule(torch.nn.Module):
                     prev_att = torch.cat([att_weights] + [torch.zeros((1, 1, 1))] * (5 - N), dim=1)
                 else:
                     prev_att = att_weights[:, startt:endd]
+                prev_att = prev_att.squeeze(-1)
                 assert prev_att.shape[1] == 5
                 context = torch.matmul(input_mat.transpose(1, 2), att_weights).squeeze(-1)
 
-                vector = torch.cat([context, tag_context, last_output_embeddings])
+                vector = torch.cat([context, tag_context, last_output_embeddings], dim=1)
                 s_0, new_prefix_decoder = self.dec_lstm(vector.unsqueeze(0), prefix_decoder)
                 out_vector = self.decoder(s_0.squeeze(0))
-                probs = torch.softmax(out_vector, dim=-1)
+                probs = torch.softmax(out_vector, dim=-1).squeeze(0)
 
                 # Add length norm
                 length_norm = torch.pow(torch.tensor([5 + i]),
@@ -753,7 +758,7 @@ class InflectionModule(torch.nn.Module):
                 last_states[hyp_id] = new_prefix_decoder
 
                 # find best candidate outputs
-                n_best_indices = myutil.argmax(probs, beam_size)
+                n_best_indices = argmaxk(probs, beam_size)
                 for index in n_best_indices:
                     this_score = prefix_prob + np.log(probs[index])
                     next_beam_id.append((this_score, hyp_id, index, prev_att))
@@ -798,7 +803,11 @@ class InflectionModule(torch.nn.Module):
     def forward(self, input_sentences, input_tags, output_sentences, lang_ids, weight=1, tf_prob=1.0):
         return self.get_loss(input_sentences, input_tags, output_sentences, lang_ids, weight, tf_prob)
 
+    def save(self, path):
+        torch.save(self.state_dict(), path)
 
+    def populate(self, path):
+        self.load_state_dict(torch.load(path))
 
 def test_beam(inf_model, beam_size=4, fn=None):
     ks = list(range(len(test_i)))
@@ -817,6 +826,13 @@ def test_beam(inf_model, beam_size=4, fn=None):
 
     return
 
+
+def argmaxk(arr, k):
+    k = min(k, len(arr))
+    indices = torch.argsort(arr)
+    # get k best indices
+    indices = indices.flip((0, ))[:k]
+    return indices
 
 def eval_dev_greedy(inf_model, K=100, epoch=0):
     if K == "all":
@@ -921,18 +937,18 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / len(batch)
                     total_loss += loss.item()
-                    print(loss.item())
+                    print(f"Loss: {loss.item()}", end="\r")
                     loss.backward()
                     trainer.step()
                     batch = []
                     trainer.zero_grad()
             if batch:
-                # print(batch)
                 loss = sum(batch) / len(batch)
                 total_loss += loss.item()
                 loss.backward()
                 trainer.step()
                 trainer.zero_grad()
+            print()
             if i % 1 == 0:
                 # trainer.status()
                 print("Epoch " + str(i) + " : " + str(total_loss))
@@ -978,21 +994,37 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             batch = []
             weight = 0.0
             trainer.zero_grad()
-            for j, t in train_pairs:
-                if (t == 0 or t == 1):
+
+            def index_task_to_io(j, t):
+                if t == 0 or t == 1:
                     if random.random() > COPY_TASK_PROB:
-                        continue
+                        return ()
                 if t == 0:
-                    loss = inf_model.get_loss(inputs[j], [NULL], inputs[j], lang_ids[j], COPY_WEIGHT, 0.8)
-                    weight += COPY_WEIGHT
+                    return inputs[j], [NULL], inputs[j], lang_ids[j], COPY_WEIGHT
                 elif t == 1:
-                    loss = inf_model.get_loss(outputs[j], tags[j], outputs[j], lang_ids[j], COPY_WEIGHT, 0.8)
-                    weight += COPY_WEIGHT
+                    return outputs[j], tags[j], outputs[j], lang_ids[j], COPY_WEIGHT
                 elif t == 2:
-                    loss = inf_model.get_loss(inputs[j], tags[j], outputs[j], lang_ids[j], 1, 0.8)
-                    weight += 1.0
+                    return inputs[j], tags[j], outputs[j], lang_ids[j], 1.
+                else:
+                    raise NotImplementedError()
+
+            pairs_io = list(filter(lambda x: x != (), map(lambda x: index_task_to_io(*x), train_pairs)))
+
+            for example in data.BatchSampler(pairs_io, 1, drop_last=False):
+                # task 0 is copy input
+                # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
+                # print(example)
+                example = (list(map(lambda x: x[0], example)),  # input
+                           list(map(lambda x: x[1], example)),  # tag
+                           list(map(lambda x: x[2], example)),  # output
+                           list(map(lambda x: x[3], example)),  # lang_id
+                           list(map(lambda x: x[4], example)),  # weight
+                           )
+                loss = inf_model(*example, tf_prob=0.8)
+                weight += example[4][0]
+
                 batch.append(loss)
-                if len(batch) == MINIBATCH_SIZE or j == total_train_pairs:
+                if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / weight
                     total_loss += loss.item()
                     loss.backward()
@@ -1000,6 +1032,12 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     batch = []
                     trainer.zero_grad()
                     weight = 0.0
+            if batch:
+                loss = sum(batch) / weight
+                total_loss += loss.item()
+                loss.backward()
+                trainer.step()
+                trainer.zero_grad()
             if i % 1 == 0:
                 # trainer.status()
                 print("Epoch ", i, " : ", total_loss)
@@ -1008,18 +1046,18 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 acc, edd = eval_dev_greedy(inf_model, 100, 100 + i)
                 print("\t TASK Accuracy: ", acc, " average edit distance: ", edd)
             if acc > prev_acc:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
                 epochs_since_improv = 0
             if edd < prev_edd:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
             if (acc > prev_acc and edd < prev_edd) or (acc >= prev_acc and edd < prev_edd) or (
                     acc > prev_acc and edd <= prev_edd):
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
                 epochs_since_improv = 0
             else:
                 epochs_since_improv += 1
             if acc > prev_acc:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
                 epochs_since_improv = 0
             if acc > prev_acc:
                 prev_acc = acc
@@ -1033,7 +1071,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 learning_rate = learning_rate / 2
                 trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
-                inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if acc > 0.9 and epochs_since_improv == 4:
                 print("Accuracy good enough, breaking")
                 break
@@ -1051,17 +1089,33 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             weight = 0.0
             batch = []
             trainer.zero_grad()
-            for j, t in finetune_pairs:
+
+            def index_task_to_io(j, t):
                 if t == 1:
                     if random.random() > COPY_TASK_PROB:
-                        continue
-                    loss = inf_model.get_loss(outputs[j], tags[j], outputs[j], lang_ids[j], COPY_WEIGHT, 0.5)
-                    weight += COPY_WEIGHT
+                        return ()
+                    return outputs[j], tags[j], outputs[j], lang_ids[j], COPY_WEIGHT
                 elif t == 2:
-                    loss = inf_model.get_loss(inputs[j], tags[j], outputs[j], lang_ids[j], 1, 0.5)
-                    weight += 1
+                    return inputs[j], tags[j], outputs[j], lang_ids[j], 1.
+                else:
+                    raise NotImplementedError()
+
+            pairs_io = list(filter(lambda x: x != (), map(lambda x: index_task_to_io(*x), finetune_pairs)))
+
+            for example in data.BatchSampler(pairs_io, 1, drop_last=False):
+                # task 0 is copy input
+                # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
+                # print(example)
+                example = (list(map(lambda x: x[0], example)),  # input
+                           list(map(lambda x: x[1], example)),  # tag
+                           list(map(lambda x: x[2], example)),  # output
+                           list(map(lambda x: x[3], example)),  # lang_id
+                           list(map(lambda x: x[4], example)),  # weight
+                           )
+                loss = inf_model(*example, tf_prob=0.5)
+                weight += example[4][0]
                 batch.append(loss)
-                if len(batch) == MINIBATCH_SIZE or j == total_finetune_pairs:
+                if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / weight
                     total_loss += loss.item()
                     loss.backward()
@@ -1069,6 +1123,12 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     batch = []
                     trainer.zero_grad()
                     weight = 0.0
+            if batch:
+                loss = sum(batch) / weight
+                total_loss += loss.item()
+                loss.backward()
+                trainer.step()
+                trainer.zero_grad()
             if i % 1 == 0:
                 print("Epoch ", i, " : ", total_loss)
                 # trainer.status()
@@ -1077,12 +1137,12 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 acc, edd = eval_dev_greedy(inf_model, "all", 140 + i)
                 print("\t TASK Accuracy: ", acc, " average edit distance: ", edd)
             if acc > prev_acc:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if edd < prev_edd:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
             if (acc > prev_acc and edd < prev_edd) or (acc >= prev_acc and edd < prev_edd) or (
                     acc > prev_acc and edd <= prev_edd):
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
                 epochs_since_improv = 0
             else:
                 epochs_since_improv += 1
@@ -1099,24 +1159,44 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 learning_rate = learning_rate / 2
                 trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
-                inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
 
         halvings = 0
         for i in range(40):
-            shuffle(indexes)
+            shuffle(final_finetune_pairs)
             total_loss = 0.0
             batch = []
             trainer.zero_grad()
-            for j, t in final_finetune_pairs:
-                loss = inf_model.get_loss(inputs[j], tags[j], outputs[j], lang_ids[j], 1, 0.5)
+
+            def index_task_to_io(j, t):
+                return inputs[j], tags[j], outputs[j], lang_ids[j]
+
+            pairs_io = list(filter(lambda x: x != (), map(lambda x: index_task_to_io(*x), final_finetune_pairs)))
+
+            for example in data.BatchSampler(pairs_io, 1, drop_last=False):
+                # task 0 is copy input
+                # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
+                # print(example)
+                example = (list(map(lambda x: x[0], example)),  # input
+                           list(map(lambda x: x[1], example)),  # tag
+                           list(map(lambda x: x[2], example)),  # output
+                           list(map(lambda x: x[3], example)),  # lang_id
+                           )
+                loss = inf_model(*example, tf_prob=0.5)
                 batch.append(loss)
-                if len(batch) == MINIBATCH_SIZE or j == total_final_finetune_pairs:
+                if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / len(batch)
                     total_loss += loss.item()
                     loss.backward()
                     trainer.step()
                     batch = []
                     trainer.zero_grad()
+            if batch:
+                loss = sum(batch) / len(batch)
+                total_loss += loss.item()
+                loss.backward()
+                trainer.step()
+                trainer.zero_grad()
             if i % 1 == 0:
                 print("Epoch ", i, " : ", total_loss)
                 # trainer.status()
@@ -1125,12 +1205,12 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 acc, edd = eval_dev_greedy(inf_model, "all", 160 + i)
                 print("\t TASK Accuracy: ", acc, " average edit distance: ", edd)
             if acc > prev_acc:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if edd < prev_edd:
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "edd.model"))
             if (acc > prev_acc and edd < prev_edd) or (acc >= prev_acc and edd < prev_edd) or (
                     acc > prev_acc and edd <= prev_edd):
-                inf_model.model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
+                inf_model.save(os.path.join(MODEL_DIR, MODEL_NAME + "both.model"))
                 epochs_since_improv = 0
             else:
                 epochs_since_improv += 1
@@ -1147,7 +1227,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 learning_rate = learning_rate / 2
                 trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
-                inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+                inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
 
     return trainer, prev_acc, prev_edd
 
@@ -1201,7 +1281,7 @@ if TRAIN:
 
 elif TEST:
     inflection_model = InflectionModule()
-    inflection_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
+    inflection_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
     if args.outputfile:
         test_beam(inflection_model, 8, args.outputfile)
     else:

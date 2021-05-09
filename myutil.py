@@ -1,8 +1,6 @@
 import numpy as np
 import codecs
 import re
-from collections import defaultdict
-from random import random, choice
 
 def edit_distance(str1, str2):
     '''Simple Levenshtein implementation for evalm.'''
