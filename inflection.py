@@ -662,7 +662,6 @@ class InflectionModel:
 
         return out
 
-
     def draw_decode(self, in_seq, tag_seq, out_seq, show_att=False, show_tag_att=False, fn=None):
         dy.renew_cg()
         embedded = self.embed_sentence(in_seq)
@@ -758,9 +757,7 @@ class InflectionModel:
             plt.clf()
             plt.close()
 
-
         return
-
 
     def generate_nbest(self, in_seq, tag_seq, beam_size=4, show_att=False, show_tag_att=False, fn=None):
         dy.renew_cg()
@@ -889,7 +886,6 @@ class InflectionModel:
 
         return nbest
 
-
     def get_loss(self, input_sentence, input_tags, output_sentence, lang_id, weight=1, tf_prob=1.0):
         embedded = self.embed_sentence(input_sentence)
         encoded = self.encode_sentence(embedded)
@@ -899,7 +895,6 @@ class InflectionModel:
         encoded_tags = self.self_encode_tags(embedded_tags)
 
         return self.decode(encoded, encoded_tags, output_sentence, lang_id, weight, tf_prob)
-
 
 
 def ensemble_generate_nbest(inf_models, ensemble_weights, in_seq, tag_seq, beam_size=4):
@@ -1190,6 +1185,7 @@ def eval_dev_greedy(inf_model, K=100, epoch=0):
     avg_edit = np.average(np.array(levs))
     return accuracy, avg_edit
 
+
 def eval_dev_copy_greedy(inf_model, K=40, epoch=0):
     if K == "all":
         K = len(dev_i)
@@ -1210,7 +1206,6 @@ def eval_dev_copy_greedy(inf_model, K=40, epoch=0):
     accuracy = correct/float(K)
     avg_edit = np.average(np.array(levs))
     return accuracy, avg_edit
-
 
 
 def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=None, finetune=False, trainer=None, prev_acc=None, prev_edd=None):

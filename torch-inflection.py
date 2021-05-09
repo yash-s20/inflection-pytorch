@@ -1,7 +1,6 @@
 import argparse
 import codecs
 import matplotlib
-import dynet as dy
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import myutil
@@ -351,7 +350,7 @@ class InflectionModule(torch.nn.Module):
         self.attn_w3 = torch.nn.Linear(5, ATTENTION_SIZE, bias=False)
         self.attn_v = torch.nn.Linear(ATTENTION_SIZE, 1, bias=False)
 
-        self.decoder = self.nn.Linear(STATE_SIZE, VOCAB_SIZE)
+        self.decoder = torch.nn.Linear(STATE_SIZE, VOCAB_SIZE)
         self.output_lookup = self.input_lookup
 
         self.enc_tag_lstm = torch.nn.LSTM(input_size=EMBEDDINGS_SIZE, hidden_size=STATE_SIZE,
@@ -369,8 +368,9 @@ class InflectionModule(torch.nn.Module):
         tags_list: is a list of list of tags. batched basically.
         return (B, L, D)
         """
-        int_tags = [[tag2int[t] for t in tags] for tags in tags_list]
-        return torch.stack([torch.stack([self.tag_input_lookup[tag] for tag in tags]) for tags in int_tags])
+        int_tags = torch.stack([torch.tensor([tag2int[t] for t in tags]) for tags in tags_list])
+        print(int_tags)
+        return self.tag_input_lookup(int_tags)
 
     def embed_sentence(self, sentences):
         """
@@ -378,8 +378,9 @@ class InflectionModule(torch.nn.Module):
         """
         # TODO: need to pad for bigger batch size than 1. currently no support for padding
         sentences = [[EOS] + list(sentence) + [EOS] for sentence in sentences]
-        sentences = [[char2int[c] for c in sentence] for sentence in sentences]
-        return torch.stack([torch.stack([self.input_lookup[char] for char in sentence]) for sentence in sentences])
+        sentences = torch.stack([torch.tensor([char2int[c] for c in sentence]) for sentence in sentences])
+        print(sentences)
+        return self.input_lookup(sentences)
 
     def self_encode_tags(self, tags):
         """
@@ -457,7 +458,7 @@ class InflectionModule(torch.nn.Module):
         tag_input_mat = tag_vectors
         # (B, L, D) both
         tag_w1dt = None
-        last_output_embeddings = torch.stack([self.output_lookup[char2int[EOS]] for _ in range(batch_size)])
+        last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS] for _ in range(batch_size)]))
         temp_output, (h_n, c_n) = self.dec_lstm(torch.cat([vectors[:, -1, :],
                                                            tag_vectors[:, -1, :],
                                                            last_output_embeddings]).unsqueeze(0))
@@ -531,6 +532,254 @@ class InflectionModule(torch.nn.Module):
             loss += torch.nn.SmoothL1Loss()(torch.ones((batch_size, tag_N, 1)), total_tag_att)
         return loss
 
+    @torch.no_grad()
+    def generate(self, in_seq, tag_seq, show_att=False, show_tag_att=False, fn=None):
+        embedded = self.embed_sentence([in_seq])
+        encoded = self.encode_sentence(embedded)
+
+        embedded_tags = self.embed_tags([tag_seq])
+        # encoded_tags = self.encode_tags(embedded_tags)
+        encoded_tags = self.self_encode_tags(embedded_tags)
+
+        input_mat = encoded
+        tag_input_mat = encoded_tags
+        w1dt = None
+        tag_w1dt = None
+
+        prev_att = torch.zeros((1, 5))
+
+        tmpinseq = [EOS] + list(in_seq) + [EOS]
+        N = len(tmpinseq)
+
+        last_output_embeddings = self.output_lookup[char2int[EOS]].unsqueeze(0)
+        _, (h_n, c_n) = self.dec_lstm(torch.cat([encoded[-1],
+                                                encoded_tags[-1],
+                                                last_output_embeddings]))
+        out = ''
+        batch_size = 1
+        count_EOS = 0
+        if show_att:
+            attt_weights = []
+        if show_tag_att:
+            ttt_weights = []
+        for i in range(len(in_seq) * 2):
+            w1dt = w1dt or self.attn_w1(input_mat)
+            tag_w1dt = tag_w1dt or self.tag_attn_w1(tag_input_mat)
+            state = h_n
+            tag_att_weights = self.attend_tags(state, tag_w1dt)
+            tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
+            # this was (B, D, L) x (B, L, 1)
+            # (B, D)
+            tag_context2 = torch.cat([tag_context, tag_context], dim=-1)
+            # (B, 2D)
+            new_state = state + tag_context
+
+            att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
+
+            context = torch.matmul(input_mat.transpose(1, 2), att_weights).squeeze(-1)
+            # (B, 2D)
+
+            best_ic = torch.argmax(att_weights, dim=1).squeeze().item()
+            startt = min(best_ic - 1, N - 6)
+            if startt < 0:
+                startt = 0
+            end = startt + 5
+            if N < 5:
+                prev_att = torch.cat([att_weights] + [torch.zeros((batch_size, 1, 1))] * (5 - N), dim=1)
+            else:
+                prev_att = att_weights[:, startt:end]
+            prev_att = prev_att.squeeze(-1)
+            assert prev_att.shape[1] == 5
+
+            if show_att:
+                attt_weights.append(att_weights)
+            if show_tag_att:
+                ttt_weights.append(tag_att_weights)
+
+            vector = torch.cat([context, tag_context, last_output_embeddings])
+            s_out, (h_n, c_n) = self.dec_lstm(vector.unsqueeze(0), (h_n, c_n))
+            s_out = s_out.squeeze(0)
+            # (B, STATE_SIZE)
+            s_out = torch.dropout(s_out, DROPOUT_PROB, train=True)
+
+            out_vector = self.decoder(s_out)
+            # (B, VOCAB_SIZE)
+            probs = torch.softmax(out_vector, dim=-1)
+            next_char = np.argmax(probs)
+            last_output_embeddings = self.output_lookup[next_char]
+            if int2char[next_char] == EOS:
+                count_EOS += 1
+                continue
+
+            out += int2char[next_char]
+
+        if (show_att) and len(out) and fn is not None:
+            arr = np.squeeze(np.array(attt_weights))[1:-1, 1:-1]
+            fig, ax = plt.subplots()
+            ax = plt.imshow(arr)
+            x_positions = np.arange(0, len(attt_weights[0]) - 2)
+            y_positions = np.arange(0, len(out))
+            plt.xticks(x_positions, list(in_seq))
+            plt.yticks(y_positions, list(out))
+            plt.savefig(fn + '-char.png')
+            plt.clf()
+            plt.close()
+
+        if (show_tag_att) and len(out) and fn is not None:
+            arr = np.squeeze(np.array(ttt_weights))[1:-1, :]
+            fig, ax = plt.subplots()
+            ax = plt.imshow(arr)
+            x_positions = np.arange(0, len(ttt_weights[0]))
+            y_positions = np.arange(0, len(out))
+            plt.xticks(x_positions, list(tag_seq))
+            plt.yticks(y_positions, list(out))
+            plt.savefig(fn + '-tag.png')
+            plt.clf()
+            plt.close()
+
+        return out
+
+    @torch.no_grad()
+    def generate_nbest(self, in_seq, tag_seq, beam_size=4, show_att=False, show_tag_att=False, fn=None):
+        try:
+            embedded = self.embed_sentence([in_seq])
+        except:
+            return []
+        encoded = self.encode_sentence(embedded)
+
+        embedded_tags = self.embed_tags([tag_seq])
+        # encoded_tags = self.encode_tags(embedded_tags)
+        encoded_tags = self.self_encode_tags(embedded_tags)
+
+        input_mat = encoded
+        tag_input_mat = encoded_tags
+        prev_att = torch.zeros((1, 5))
+
+        tmpinseq = [EOS] + list(in_seq) + [EOS]
+        N = len(tmpinseq)
+
+        last_output_embeddings = torch.stack([self.output_lookup[char2int[EOS]] for _ in range(1)])
+        init_vector = torch.cat([encoded[-1], encoded_tags[-1], last_output_embeddings]).unsqueeze(0)
+        s_0, (h_n, c_n) = self.dec_lstm(init_vector)
+        w1dt = self.attn_w1(input_mat)
+
+        tag_w1dt = self.tag_attn_w1(tag_input_mat)
+
+        beam = {0: [(0, (h_n, c_n), [], prev_att)]}
+        i = 1
+
+        nbest = []
+        # we'll need this
+        last_states = {}
+
+        MAX_PREDICTION_LEN = max(len(in_seq) * 1.5, MAX_PREDICTION_LEN_DEF)
+
+        # expand another step if didn't reach max length and there's still beams to expand
+        while i < MAX_PREDICTION_LEN and len(beam[i - 1]) > 0:
+            # create all expansions from the previous beam:
+            next_beam_id = []
+            for hyp_id, hypothesis in enumerate(beam[i - 1]):
+                # expand hypothesis tuple
+                # prefix_seq, prefix_prob, prefix_decoder, prefix_context, prefix_tag_context = hypothesis
+                prefix_prob, prefix_decoder, prefix_seq, prefix_att = hypothesis
+
+                if i > 1:
+                    last_hypo_symbol = prefix_seq[-1]
+                else:
+                    last_hypo_symbol = EOS
+
+                # cant expand finished sequences
+                if last_hypo_symbol == EOS and i > 3:
+                    continue
+                # expand from the last symbol of the hypothesis
+                last_output_embeddings = torch.stack([self.output_lookup[char2int[last_hypo_symbol]]], dim=0)
+
+                # Perform the forward step on the decoder
+                # First, set the decoder's parameters to what they were in the previous step
+                # if (i == 1):
+                #     s = self.dec_lstm.initial_state().add_input(init_vector)
+                # else:
+                #     s = self.dec_lstm.initial_state(prefix_decoder)
+
+                state = prefix_decoder[0] # h_n
+                tag_att_weights = self.attend_tags(state, tag_w1dt)
+                tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
+                tag_context2 = torch.cat([tag_context, tag_context], dim=-1)
+                new_state = state + tag_context2
+
+                att_weights = self.attend_with_prev(new_state, w1dt, prefix_att)
+                best_ic = torch.argmax(att_weights, dim=1).squeeze().item()
+                startt = min(best_ic - 2, N - 6)
+                if startt < 0:
+                    startt = 0
+                endd = startt + 5
+                if N < 5:
+                    prev_att = torch.cat([att_weights] + [torch.zeros((1, 1, 1))] * (5 - N), dim=1)
+                else:
+                    prev_att = att_weights[:, startt:endd]
+                assert prev_att.shape[1] == 5
+                context = torch.matmul(input_mat.transpose(1, 2), att_weights).squeeze(-1)
+
+                vector = torch.cat([context, tag_context, last_output_embeddings])
+                s_0, new_prefix_decoder = self.dec_lstm(vector.unsqueeze(0), prefix_decoder)
+                out_vector = self.decoder(s_0.squeeze(0))
+                probs = torch.softmax(out_vector, dim=-1)
+
+                # Add length norm
+                length_norm = torch.pow(torch.tensor([5 + i]),
+                                        LENGTH_NORM_WEIGHT) / (np.power(torch.tensor([6]),
+                                                                        LENGTH_NORM_WEIGHT))
+                probs = probs / length_norm
+
+                last_states[hyp_id] = new_prefix_decoder
+
+                # find best candidate outputs
+                n_best_indices = myutil.argmax(probs, beam_size)
+                for index in n_best_indices:
+                    this_score = prefix_prob + np.log(probs[index])
+                    next_beam_id.append((this_score, hyp_id, index, prev_att))
+                next_beam_id.sort(key=itemgetter(0), reverse=True)
+                next_beam_id = next_beam_id[:beam_size]
+
+            # Create the most probable hypotheses
+            # add the most probable expansions from all hypotheses to the beam
+            new_hypos = []
+            for item in next_beam_id:
+                hypid = item[1]
+                this_prob = item[0]
+                char_id = item[2]
+                next_sentence = beam[i - 1][hypid][2] + [int2char[char_id]]
+                new_hyp = (this_prob, last_states[hypid], next_sentence, item[3])
+                new_hypos.append(new_hyp)
+                if next_sentence[-1] == EOS or i == MAX_PREDICTION_LEN - 1:
+                    if ''.join(next_sentence) != "<EOS>" and ''.join(next_sentence) != "<EOS><EOS>" and ''.join(
+                            next_sentence) != "<EOS><EOS><EOS>":
+                        nbest.append(new_hyp)
+
+            beam[i] = new_hypos
+            i += 1
+            if len(nbest) > 0:
+                nbest.sort(key=itemgetter(0), reverse=True)
+                nbest = nbest[:beam_size]
+            if len(nbest) == beam_size and (len(new_hypos) == 0 or (nbest[-1][0] >= new_hypos[0][0])):
+                break
+
+        return nbest
+
+    def get_loss(self, input_sentences, input_tags, output_sentences, lang_ids, weight=1, tf_prob=1.0):
+        embedded = self.embed_sentence(input_sentences)
+        encoded = self.encode_sentence(embedded)
+
+        embedded_tags = self.embed_tags(input_tags)
+
+        encoded_tags = self.self_encode_tags(embedded_tags)
+
+        return self.decode(encoded, encoded_tags, output_sentences, lang_ids, weight, tf_prob)
+
+    def forward(self, input_sentences, input_tags, output_sentences, lang_ids, weight=1, tf_prob=1.0):
+        return self.get_loss(input_sentences, input_tags, output_sentences, lang_ids, weight, tf_prob)
+
+
 
 def test_beam(inf_model, beam_size=4, fn=None):
     ks = list(range(len(test_i)))
@@ -548,12 +797,6 @@ def test_beam(inf_model, beam_size=4, fn=None):
             outf.write(''.join(test_i[k]) + '\t' + word + '\t' + ';'.join(test_t[k]) + '\n')
 
     return
-
-
-def draw_decode(inf_model, K=20):
-    for k in range(K):
-        filename = os.path.join(FIGURE_DIR, str(k))
-        inf_model.draw_decode(dev_i[k], dev_t[k], dev_o[k], show_att=True, show_tag_att=True, fn=filename)
 
 
 def eval_dev_greedy(inf_model, K=100, epoch=0):
@@ -614,7 +857,8 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
     total_final_finetune_pairs = len(finetune_pairs)
 
     learning_rate = STARTING_LEARNING_RATE
-    trainer = trainer or dy.SimpleSGDTrainer(inf_model.model, learning_rate)
+    # trainer = trainer or dy.SimpleSGDTrainer(inf_model.model, learning_rate)
+    trainer = trainer or torch.optim.SGD(inf_model.parameters(), learning_rate)
     epochs_since_improv = 0
     halvings = 0
     # trainer.set_clip_threshold(-1.0)
@@ -632,7 +876,8 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             shuffle(burnin_pairs)
             total_loss = 0.0
             batch = []
-            dy.renew_cg()
+            # dy.renew_cg()
+            trainer.zero_grad()
 
             def index_task_to_io(j, t):
                 if t == 0:
@@ -650,23 +895,24 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                            list(map(lambda x: x[2], example)), # output
                            list(map(lambda x: x[3], example))) # lang_id
                 print(example)
-                loss = 0
+                # loss = 0
+                loss = inf_model(*example)
                 exit(1)
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE:
-                    loss = dy.esum(batch) / len(batch)
+                    loss = sum(batch) / len(batch)
                     total_loss += loss.value()
                     loss.backward()
-                    trainer.update()
+                    trainer.step()
                     batch = []
-                    dy.renew_cg()
+                    trainer.zero_grad()
             if batch:
                 print(batch)
-                loss = dy.esum(batch) / len(batch)
+                loss = sum(batch) / len(batch)
                 total_loss += loss.value()
                 loss.backward()
-                trainer.update()
-                dy.renew_cg()
+                trainer.step()
+                trainer.zero_grad()
             if i % 1 == 0:
                 trainer.status()
                 print("Epoch " + str(i) + " : " + str(total_loss))
@@ -693,7 +939,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 halvings += 1
                 if halvings == 1:
                     break
-                trainer.restart(learning_rate)
+                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if acc > COPY_THRESHOLD:
@@ -711,7 +957,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             total_loss = 0.0
             batch = []
             weight = 0.0
-            dy.renew_cg()
+            trainer.zero_grad()
             for j, t in train_pairs:
                 if (t == 0 or t == 1):
                     if random() > COPY_TASK_PROB:
@@ -727,12 +973,12 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     weight += 1.0
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE or j == total_train_pairs:
-                    loss = dy.esum(batch) / weight
+                    loss = sum(batch) / weight
                     total_loss += loss.value()
                     loss.backward()
-                    trainer.update()
+                    trainer.step()
                     batch = []
-                    dy.renew_cg()
+                    trainer.zero_grad()
                     weight = 0.0
             if i % 1 == 0:
                 trainer.status()
@@ -765,7 +1011,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if halvings == 2:
                     break
                 learning_rate = learning_rate / 2
-                trainer.restart(learning_rate)
+                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if acc > 0.9 and epochs_since_improv == 4:
@@ -777,14 +1023,14 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
         MINIBATCH_SIZE = 1
         if learning_rate < 0.05:
             learning_rate = 0.05
-        trainer.restart(learning_rate)
+        trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
         halvings = 0
         for i in range(40):
             shuffle(finetune_pairs)
             total_loss = 0.0
             weight = 0.0
             batch = []
-            dy.renew_cg()
+            trainer.zero_grad()
             for j, t in finetune_pairs:
                 if t == 1:
                     if random() > COPY_TASK_PROB:
@@ -796,16 +1042,16 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     weight += 1
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE or j == total_finetune_pairs:
-                    loss = dy.esum(batch) / weight
+                    loss = sum(batch) / weight
                     total_loss += loss.value()
                     loss.backward()
-                    trainer.update()
+                    trainer.step()
                     batch = []
-                    dy.renew_cg()
+                    trainer.zero_grad()
                     weight = 0.0
             if i % 1 == 0:
                 print("Epoch ", i, " : ", total_loss)
-                trainer.status()
+                # trainer.status()
                 acc, edd = eval_dev_copy_greedy(inf_model, 20, 140 + i)
                 print("\t COPY Accuracy: ", acc, " average edit distance: ", edd)
                 acc, edd = eval_dev_greedy(inf_model, "all", 140 + i)
@@ -831,7 +1077,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if halvings == 2:
                     break
                 learning_rate = learning_rate / 2
-                trainer.restart(learning_rate)
+                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
 
@@ -840,20 +1086,20 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             shuffle(indexes)
             total_loss = 0.0
             batch = []
-            dy.renew_cg()
+            trainer.zero_grad()
             for j, t in final_finetune_pairs:
                 loss = inf_model.get_loss(inputs[j], tags[j], outputs[j], lang_ids[j], 1, 0.5)
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE or j == total_final_finetune_pairs:
-                    loss = dy.esum(batch) / len(batch)
+                    loss = sum(batch) / len(batch)
                     total_loss += loss.value()
                     loss.backward()
-                    trainer.update()
+                    trainer.step()
                     batch = []
-                    dy.renew_cg()
+                    trainer.zero_grad()
             if i % 1 == 0:
                 print("Epoch ", i, " : ", total_loss)
-                trainer.status()
+                # trainer.status()
                 acc, edd = eval_dev_copy_greedy(inf_model, 20, 160 + i)
                 print("\t COPY Accuracy: ", acc, " average edit distance: ", edd)
                 acc, edd = eval_dev_greedy(inf_model, "all", 160 + i)
@@ -879,7 +1125,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if halvings == 3:
                     break
                 learning_rate = learning_rate / 2
-                trainer.restart(learning_rate)
+                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
 
@@ -888,7 +1134,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
 
 # equivalent of main
 if TRAIN:
-    inflection_model = InflectionModel()
+    inflection_model = InflectionModule()
     if PREDICT_LANG:
         if ORIGINAL or SWAP:
             # lids_1 = [0]*MULTIPLY*len(low_i) + [1]*len(high_i)
@@ -934,7 +1180,7 @@ if TRAIN:
             print("Best dev lev distance after finetuning: ", best_edd)
 
 elif TEST:
-    inflection_model = InflectionModel()
+    inflection_model = InflectionModule()
     inflection_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
     if args.outputfile:
         test_beam(inflection_model, 8, args.outputfile)
