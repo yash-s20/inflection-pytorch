@@ -7,7 +7,8 @@ import myutil
 import numpy as np
 from operator import itemgetter
 import os, sys
-from random import random, shuffle
+from random import shuffle
+import random
 import logging
 import torch
 import torch.utils.data as data
@@ -39,8 +40,12 @@ parser.add_argument("--use_att_reg", help="use attention regularization on the l
 parser.add_argument("--use_tag_att_reg", help="use attention regularization on the tag attention (def: False)",
                     action="store_true")
 parser.add_argument("--dynet-mem", help="set dynet memory", default=800, type=int, required=False)
+parser.add_argument("--seed", help="random seed", default=42, type=int, required=False)
 parser.add_argument("--dynet-autobatch", help="use dynet autobatching (def: 1)", default=1, type=int, required=False)
+
+
 args = parser.parse_args()
+random.seed(args.seed)
 
 
 if args.L1:
@@ -357,7 +362,7 @@ class InflectionModule(torch.nn.Module):
                                           num_layers=LSTM_NUM_OF_LAYERS, bidirectional=False)
         self.tag_attn_w1 = torch.nn.Linear(STATE_SIZE, ATTENTION_SIZE, bias=False)
         self.tag_attn_w2 = torch.nn.Linear(STATE_SIZE * 2 * LSTM_NUM_OF_LAYERS, ATTENTION_SIZE, bias=False)
-        self.tag_attn_v = torch.nn.Linear(STATE_SIZE, ATTENTION_SIZE, bias=False)
+        self.tag_attn_v = torch.nn.Linear(ATTENTION_SIZE, 1, bias=False)
 
         if PREDICT_LANG:
             self.lang_class_w = torch.nn.Linear(NUM_LANG, 2 * STATE_SIZE, bias=False)
@@ -369,7 +374,7 @@ class InflectionModule(torch.nn.Module):
         return (B, L, D)
         """
         int_tags = torch.stack([torch.tensor([tag2int[t] for t in tags]) for tags in tags_list])
-        print(int_tags)
+        # print(int_tags)
         return self.tag_input_lookup(int_tags)
 
     def embed_sentence(self, sentences):
@@ -379,7 +384,7 @@ class InflectionModule(torch.nn.Module):
         # TODO: need to pad for bigger batch size than 1. currently no support for padding
         sentences = [[EOS] + list(sentence) + [EOS] for sentence in sentences]
         sentences = torch.stack([torch.tensor([char2int[c] for c in sentence]) for sentence in sentences])
-        print(sentences)
+        # print(sentences)
         return self.input_lookup(sentences)
 
     def self_encode_tags(self, tags):
@@ -412,12 +417,19 @@ class InflectionModule(torch.nn.Module):
         # w2dt: (attdim x attdim)
         # state: (B, D)
         # w2dt = self.tag_attention_w2 * state
+        # print(state.shape)
+        # print(self.tag_attn_w2)
         w2dt = self.tag_attn_w2(state)  # (B, A)
-        # w1dt : (B, A, L)
+        # w1dt : (B, L, A)
         # att_weights: (seqlen,) row vector
-        unnormalized = self.tag_attn_v(torch.tanh(w1dt + w2dt).transpose(1, 2))
+        # print(w1dt.shape)
+        # print(w2dt.shape)
+        temp = torch.tanh(w1dt + w2dt)
+        # print(temp.shape)
+        unnormalized = self.tag_attn_v(temp)
         # (B, L, 1)
         att_weights = torch.softmax(unnormalized, dim=1)
+        # print(att_weights.shape)
         # context: (encoder_state)
         return att_weights
 
@@ -436,10 +448,15 @@ class InflectionModule(torch.nn.Module):
         # input_mat: (encoder_state x seqlen) => input vecs concatenated as cols
         # w1dt: (attdim x seqlen)
         # w2dt: (attdim x attdim)
+        # print(state.shape)
         w2dt = self.attn_w2(state)
         w3dt = self.attn_w3(prev_att)
         # att_weights: (seqlen,) row vector
-        unnormalized = self.attn_v(torch.tanh(w1dt + w2dt + w3dt).transpose(1, 2))
+        # print(w1dt.shape)
+        # print(w2dt.shape)
+        # print(w3dt.shape)
+        # print(self.attn_v)
+        unnormalized = self.attn_v(torch.tanh(w1dt + w2dt + w3dt))
         att_weights = torch.softmax(unnormalized, dim=1)
         # (B, L, 1)
         return att_weights
@@ -459,10 +476,9 @@ class InflectionModule(torch.nn.Module):
         # (B, L, D) both
         tag_w1dt = None
         last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS] for _ in range(batch_size)]))
-        temp_output, (h_n, c_n) = self.dec_lstm(torch.cat([vectors[:, -1, :],
-                                                           tag_vectors[:, -1, :],
-                                                           last_output_embeddings]).unsqueeze(0))
-        temp_output = temp_output.squeeze(0)
+        temp = torch.cat([vectors[:, -1, :], tag_vectors[:, -1, :], last_output_embeddings], dim=1).unsqueeze(0)
+        # print(temp.shape)
+        _, (h_n, c_n) = self.dec_lstm(temp)
         # this is hacky because we're taking the last index even for the reverse direction
 
         loss = []
@@ -474,16 +490,22 @@ class InflectionModule(torch.nn.Module):
             total_tag_att = torch.zeros((batch_size, tag_N, 1))
         assert batch_size == 1
         for char in outputs[0]:
-            w1dt = w1dt or self.attn_w1(input_mat)
-            tag_w1dt = tag_w1dt or self.tag_attn_w1(tag_input_mat)
-            state = h_n
+            w1dt = w1dt if w1dt is not None else self.attn_w1(input_mat)
+            tag_w1dt = tag_w1dt if tag_w1dt is not None else self.tag_attn_w1(tag_input_mat)
+            # print(h_n.shape)
+            state = torch.cat((h_n, c_n), dim=-1).squeeze(0)
             tag_att_weights = self.attend_tags(state, tag_w1dt)
+            # print(tag_input_mat.shape)
+            # print(tag_att_weights.shape)
             tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
             # this was (B, D, L) x (B, L, 1)
             # (B, D)
+            # print(tag_context.shape)
             tag_context2 = torch.cat([tag_context, tag_context], dim=-1)
             # (B, 2D)
-            new_state = state + tag_context
+            # print(state.shape)
+            # print(tag_context2.shape)
+            new_state = state + tag_context2
 
             att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
 
@@ -507,7 +529,7 @@ class InflectionModule(torch.nn.Module):
             if USE_TAG_ATT_REG:
                 total_tag_att = total_tag_att + tag_att_weights
 
-            vector = torch.cat([context, tag_context, last_output_embeddings])
+            vector = torch.cat([context, tag_context, last_output_embeddings], dim=1)
             s_out, (h_n, c_n) = self.dec_lstm(vector.unsqueeze(0), (h_n, c_n))
             s_out = s_out.squeeze(0)
             # (B, STATE_SIZE)
@@ -515,9 +537,10 @@ class InflectionModule(torch.nn.Module):
 
             out_vector = self.decoder(s_out)
             # (B, VOCAB_SIZE)
-            probs = torch.softmax(out_vector, dim=-1)
+            # print(out_vector.shape)
+            probs = torch.softmax(out_vector, dim=-1).squeeze()
             if teacher_prob == 1.:
-                last_output_embeddings = self.output_lookup[char]
+                last_output_embeddings = self.output_lookup(torch.tensor([char]))
             else:
                 raise NotImplementedError()
             loss.append(-torch.log(probs[char]))
@@ -551,9 +574,9 @@ class InflectionModule(torch.nn.Module):
         tmpinseq = [EOS] + list(in_seq) + [EOS]
         N = len(tmpinseq)
 
-        last_output_embeddings = self.output_lookup[char2int[EOS]].unsqueeze(0)
-        _, (h_n, c_n) = self.dec_lstm(torch.cat([encoded[-1],
-                                                encoded_tags[-1],
+        last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS] for _ in range(1)]))
+        _, (h_n, c_n) = self.dec_lstm(torch.cat([encoded[:, -1, :],
+                                                encoded_tags[:, -1, :],
                                                 last_output_embeddings]))
         out = ''
         batch_size = 1
@@ -565,7 +588,7 @@ class InflectionModule(torch.nn.Module):
         for i in range(len(in_seq) * 2):
             w1dt = w1dt or self.attn_w1(input_mat)
             tag_w1dt = tag_w1dt or self.tag_attn_w1(tag_input_mat)
-            state = h_n
+            state = torch.cat((h_n, c_n), dim=-1).squeeze(0)
             tag_att_weights = self.attend_tags(state, tag_w1dt)
             tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
             # this was (B, D, L) x (B, L, 1)
@@ -606,7 +629,7 @@ class InflectionModule(torch.nn.Module):
             # (B, VOCAB_SIZE)
             probs = torch.softmax(out_vector, dim=-1)
             next_char = np.argmax(probs)
-            last_output_embeddings = self.output_lookup[next_char]
+            last_output_embeddings = self.output_lookup(torch.tensor([next_char]))
             if int2char[next_char] == EOS:
                 count_EOS += 1
                 continue
@@ -658,7 +681,7 @@ class InflectionModule(torch.nn.Module):
         tmpinseq = [EOS] + list(in_seq) + [EOS]
         N = len(tmpinseq)
 
-        last_output_embeddings = torch.stack([self.output_lookup[char2int[EOS]] for _ in range(1)])
+        last_output_embeddings = self.output_lookup(torch.tensor([char2int[EOS] for _ in range(1)]))
         init_vector = torch.cat([encoded[-1], encoded_tags[-1], last_output_embeddings]).unsqueeze(0)
         s_0, (h_n, c_n) = self.dec_lstm(init_vector)
         w1dt = self.attn_w1(input_mat)
@@ -692,7 +715,7 @@ class InflectionModule(torch.nn.Module):
                 if last_hypo_symbol == EOS and i > 3:
                     continue
                 # expand from the last symbol of the hypothesis
-                last_output_embeddings = torch.stack([self.output_lookup[char2int[last_hypo_symbol]]], dim=0)
+                last_output_embeddings = self.output_lookup(torch.tensor([char2int[last_hypo_symbol] for _ in range(1)]))
 
                 # Perform the forward step on the decoder
                 # First, set the decoder's parameters to what they were in the previous step
@@ -701,7 +724,7 @@ class InflectionModule(torch.nn.Module):
                 # else:
                 #     s = self.dec_lstm.initial_state(prefix_decoder)
 
-                state = prefix_decoder[0] # h_n
+                state = torch.cat(prefix_decoder, dim=-1).squeeze(0)
                 tag_att_weights = self.attend_tags(state, tag_w1dt)
                 tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
                 tag_context2 = torch.cat([tag_context, tag_context], dim=-1)
@@ -897,19 +920,19 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 print(example)
                 # loss = 0
                 loss = inf_model(*example)
-                exit(1)
+                # exit(1)
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / len(batch)
-                    total_loss += loss.value()
+                    total_loss += loss.item()
                     loss.backward()
                     trainer.step()
                     batch = []
                     trainer.zero_grad()
             if batch:
-                print(batch)
+                # print(batch)
                 loss = sum(batch) / len(batch)
-                total_loss += loss.value()
+                total_loss += loss.item()
                 loss.backward()
                 trainer.step()
                 trainer.zero_grad()
@@ -960,7 +983,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             trainer.zero_grad()
             for j, t in train_pairs:
                 if (t == 0 or t == 1):
-                    if random() > COPY_TASK_PROB:
+                    if random.random() > COPY_TASK_PROB:
                         continue
                 if t == 0:
                     loss = inf_model.get_loss(inputs[j], [NULL], inputs[j], lang_ids[j], COPY_WEIGHT, 0.8)
@@ -974,7 +997,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE or j == total_train_pairs:
                     loss = sum(batch) / weight
-                    total_loss += loss.value()
+                    total_loss += loss.item()
                     loss.backward()
                     trainer.step()
                     batch = []
@@ -1033,7 +1056,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             trainer.zero_grad()
             for j, t in finetune_pairs:
                 if t == 1:
-                    if random() > COPY_TASK_PROB:
+                    if random.random() > COPY_TASK_PROB:
                         continue
                     loss = inf_model.get_loss(outputs[j], tags[j], outputs[j], lang_ids[j], COPY_WEIGHT, 0.5)
                     weight += COPY_WEIGHT
@@ -1043,7 +1066,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE or j == total_finetune_pairs:
                     loss = sum(batch) / weight
-                    total_loss += loss.value()
+                    total_loss += loss.item()
                     loss.backward()
                     trainer.step()
                     batch = []
@@ -1092,7 +1115,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE or j == total_final_finetune_pairs:
                     loss = sum(batch) / len(batch)
-                    total_loss += loss.value()
+                    total_loss += loss.item()
                     loss.backward()
                     trainer.step()
                     batch = []
