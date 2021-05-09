@@ -409,552 +409,127 @@ class InflectionModule(torch.nn.Module):
         # input_mat: (encoder_state x seqlen) => input vecs concatenated as cols
         # w1dt: (attdim x seqlen)
         # w2dt: (attdim x attdim)
-        # state: (B, D, L)
+        # state: (B, D)
         # w2dt = self.tag_attention_w2 * state
+        w2dt = self.tag_attn_w2(state)  # (B, A)
+        # w1dt : (B, A, L)
         # att_weights: (seqlen,) row vector
-        unnormalized = dy.transpose(self.tag_attention_v * dy.tanh(dy.colwise_add(w1dt, w2dt)))
-        att_weights = dy.softmax(unnormalized)
+        unnormalized = self.tag_attn_v(torch.tanh(w1dt + w2dt).transpose(1, 2))
+        # (B, L, 1)
+        att_weights = torch.softmax(unnormalized, dim=1)
         # context: (encoder_state)
-
-        return att_weights
-
-
-
-class InflectionModel:
-    def __init__(self):
-        self.model = dy.Model()
-
-        self.enc_fwd_lstm = dy.CoupledLSTMBuilder(LSTM_NUM_OF_LAYERS, EMBEDDINGS_SIZE, STATE_SIZE, self.model)
-        self.enc_bwd_lstm = dy.CoupledLSTMBuilder(LSTM_NUM_OF_LAYERS, EMBEDDINGS_SIZE, STATE_SIZE, self.model)
-
-        self.dec_lstm = dy.CoupledLSTMBuilder(LSTM_NUM_OF_LAYERS, STATE_SIZE * 3 + EMBEDDINGS_SIZE, STATE_SIZE, self.model)
-
-        self.input_lookup = self.model.add_lookup_parameters((VOCAB_SIZE, EMBEDDINGS_SIZE))
-        self.tag_input_lookup = self.model.add_lookup_parameters((TAG_VOCAB_SIZE, EMBEDDINGS_SIZE))
-        self.attention_w1 = self.model.add_parameters((ATTENTION_SIZE, STATE_SIZE * 2))
-        self.attention_w2 = self.model.add_parameters((ATTENTION_SIZE, STATE_SIZE * LSTM_NUM_OF_LAYERS * 2))
-        self.attention_w3 = self.model.add_parameters((ATTENTION_SIZE, 5))
-        self.attention_v = self.model.add_parameters((1, ATTENTION_SIZE))
-
-        self.decoder_w = self.model.add_parameters((VOCAB_SIZE, STATE_SIZE))
-        self.decoder_b = self.model.add_parameters((VOCAB_SIZE))
-        # output_lookup = model.add_lookup_parameters((VOCAB_SIZE, EMBEDDINGS_SIZE))
-        self.output_lookup = self.input_lookup
-
-        self.enc_tag_lstm = dy.CoupledLSTMBuilder(LSTM_NUM_OF_LAYERS, EMBEDDINGS_SIZE, STATE_SIZE, self.model)
-        self.tag_attention_w1 = self.model.add_parameters((ATTENTION_SIZE, STATE_SIZE))
-        self.tag_attention_w2 = self.model.add_parameters((ATTENTION_SIZE, STATE_SIZE * LSTM_NUM_OF_LAYERS * 2))
-        self.tag_attention_v = self.model.add_parameters((1, ATTENTION_SIZE))
-
-        if PREDICT_LANG:
-            self.lang_class_w = self.model.add_parameters((STATE_SIZE * 2, NUM_LANG))
-            # self.lang_class_w = self.model.add_parameters((STATE_SIZE*2, 1))
-
-    def embed_tags(self, tags):
-        # print(tags)
-        tags = [tag2int[t] for t in tags]
-        return [self.tag_input_lookup[tag] for tag in tags]
-
-    def embed_sentence(self, sentence):
-        sentence = [EOS] + list(sentence) + [EOS]
-        sentence = [char2int[c] for c in sentence]
-        return [self.input_lookup[char] for char in sentence]
-
-    def self_encode_tags(self, tags):
-        vectors = tags
-        # Self attention for every tag:
-        vectors = run_lstm(self.enc_tag_lstm.initial_state(), vectors)
-        tag_input_mat = dy.concatenate_cols(vectors)
-        # (S, L)
-        out_vectors = []
-        for v1 in vectors:
-            # tag input mat: [tag_emb x seqlen]
-            # v1: [tag_emb]
-            unnormalized = dy.transpose(dy.transpose(v1) * tag_input_mat)
-            # 1, seq_len
-            self_att_weights = dy.softmax(unnormalized)
-            to_add = tag_input_mat * self_att_weights
-            out_vectors.append(v1 + to_add)
-        return out_vectors
-
-    def encode_tags(self, tags):
-        vectors = run_lstm(self.enc_tag_lstm.initial_state(), tags)
-        return vectors
-
-    def encode_sentence(self, sentence):
-        sentence_rev = list(reversed(sentence))
-        fwd_vectors = run_lstm(self.enc_fwd_lstm.initial_state(), sentence)
-        # list of S
-        bwd_vectors = run_lstm(self.enc_bwd_lstm.initial_state(), sentence_rev)
-        # list of S
-        bwd_vectors = list(reversed(bwd_vectors))
-        # list of S size each, now in the order of the sentence
-        vectors = [dy.concatenate(list(p)) for p in zip(fwd_vectors, bwd_vectors)]
-        return vectors
-        # list of 2S size each, length of the list is length of the sequence
-        # S is state size
-
-    def attend_tags(self, state, w1dt):
-        # input_mat: (encoder_state x seqlen) => input vecs concatenated as cols
-        # w1dt: (attdim x seqlen)
-        # w2dt: (attdim x attdim)
-        print(state.dim())
-        w2dt = self.tag_attention_w2 * state
-        # att_weights: (seqlen,) row vector
-        unnormalized = dy.transpose(self.tag_attention_v * dy.tanh(dy.colwise_add(w1dt, w2dt)))
-        att_weights = dy.softmax(unnormalized)
-        # context: (encoder_state)
-
         return att_weights
 
     def attend(self, state, w1dt):
         # input_mat: (encoder_state x seqlen) => input vecs concatenated as cols
         # w1dt: (attdim x seqlen)
         # w2dt: (attdim x attdim)
-        w2dt = self.attention_w2 * state
+        w2dt = self.attn_w2(state)
         # att_weights: (seqlen,) row vector
-        unnormalized = dy.transpose(self.attention_v * dy.tanh(dy.colwise_add(w1dt, w2dt)))
-        att_weights = dy.softmax(unnormalized)
+        unnormalized = self.attn_v(torch.tanh(w1dt + w2dt).transpose(1, 2))
+        att_weights = torch.softmax(unnormalized, dim=1)
+        # (B, L, 1)
         return att_weights
 
     def attend_with_prev(self, state, w1dt, prev_att):
         # input_mat: (encoder_state x seqlen) => input vecs concatenated as cols
         # w1dt: (attdim x seqlen)
         # w2dt: (attdim x attdim)
-        w2dt = self.attention_w2 * state
-        w3dt = self.attention_w3 * prev_att
+        w2dt = self.attn_w2(state)
+        w3dt = self.attn_w3(prev_att)
         # att_weights: (seqlen,) row vector
-        unnormalized = dy.transpose(self.attention_v * dy.tanh(dy.colwise_add(dy.colwise_add(w1dt, w2dt), w3dt)))
-        att_weights = dy.softmax(unnormalized)
+        unnormalized = self.attn_v(torch.tanh(w1dt + w2dt + w3dt).transpose(1, 2))
+        att_weights = torch.softmax(unnormalized, dim=1)
+        # (B, L, 1)
         return att_weights
 
-    def decode(self, vectors, tag_vectors, output, lang_id, weight, teacher_prob=1.0):
-        output = [EOS] + list(output) + [EOS]
-        output = [char2int[c] for c in output]
+    def decode(self, vectors: torch.Tensor, tag_vectors, outputs, lang_ids, weight, teacher_prob=1.0):
+        # vectors is hopefully (B, L, D)
+        outputs = [[EOS] + list(output) + [EOS] for output in outputs]
+        outputs = torch.stack([torch.tensor([char2int[c] for c in output], dtype=torch.int) for output in outputs])
+        batch_size, N, _ = vectors.shape
+        _, tag_N, _ = tag_vectors.shape
+        input_mat = vectors
 
-        N = len(vectors)
-
-        input_mat = dy.concatenate_cols(vectors)
         w1dt = None
+        input_mat = torch.dropout(input_mat, DROPOUT_PROB, train=True)
 
-        input_mat = dy.dropout(input_mat, DROPOUT_PROB)
-
-        tag_input_mat = dy.concatenate_cols(tag_vectors)
+        tag_input_mat = tag_vectors
+        # (B, L, D) both
         tag_w1dt = None
+        last_output_embeddings = torch.stack([self.output_lookup[char2int[EOS]] for _ in range(batch_size)])
+        temp_output, (h_n, c_n) = self.dec_lstm(torch.cat([vectors[:, -1, :],
+                                                           tag_vectors[:, -1, :],
+                                                           last_output_embeddings]).unsqueeze(0))
+        temp_output = temp_output.squeeze(0)
+        # this is hacky because we're taking the last index even for the reverse direction
 
-        last_output_embeddings = self.output_lookup[char2int[EOS]]
-        s = self.dec_lstm.initial_state().add_input(dy.concatenate([vectors[-1], tag_vectors[-1], last_output_embeddings]))
         loss = []
-        prev_att = dy.zeros(5)
+        prev_att = torch.zeros((batch_size, 5))
 
         if USE_ATT_REG:
-            total_att = dy.zeros(N)
+            total_att = torch.zeros((batch_size, N, 1))
         if USE_TAG_ATT_REG:
-            total_tag_att = dy.zeros(len(tag_vectors))
-
-        for char in output:
-            # w1dt can be computed and cached once for the entire decoding phase
-            w1dt = w1dt or self.attention_w1 * input_mat
-            tag_w1dt = tag_w1dt or self.tag_attention_w1 * tag_input_mat
-
-            state = dy.concatenate(list(s.s()))
-
+            total_tag_att = torch.zeros((batch_size, tag_N, 1))
+        assert batch_size == 1
+        for char in outputs[0]:
+            w1dt = w1dt or self.attn_w1(input_mat)
+            tag_w1dt = tag_w1dt or self.tag_attn_w1(tag_input_mat)
+            state = h_n
             tag_att_weights = self.attend_tags(state, tag_w1dt)
-            tag_context = tag_input_mat * tag_att_weights
-
-            tag_context2 = dy.concatenate([tag_context, tag_context])
-
-            new_state = state + tag_context2
+            tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
+            # this was (B, D, L) x (B, L, 1)
+            # (B, D)
+            tag_context2 = torch.cat([tag_context, tag_context], dim=-1)
+            # (B, 2D)
+            new_state = state + tag_context
 
             att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
-            # context = input_mat * att_weights
-            best_ic = np.argmax(att_weights.vec_value())
-            context = input_mat * att_weights
-            startt = min(best_ic - 2, N - 6)
+
+            context = torch.matmul(input_mat.transpose(1, 2), att_weights).squeeze(-1)
+            # (B, 2D)
+
+            best_ic = torch.argmax(att_weights, dim=1).squeeze().item()
+            startt = min(best_ic - 1, N - 6)
             if startt < 0:
                 startt = 0
-            endd = startt + 5
-
+            end = startt + 5
             if N < 5:
-                prev_att = dy.concatenate([att_weights] + [dy.zeros(1)] * (5 - N))
+                prev_att = torch.cat([att_weights] + [torch.zeros((batch_size, 1, 1))] * (5 - N), dim=1)
             else:
-                prev_att = att_weights[startt:endd]
-            if prev_att.dim()[0][0] != 5:
-                print(prev_att.dim())
+                prev_att = att_weights[:, startt:end]
+            prev_att = prev_att.squeeze(-1)
+            assert prev_att.shape[1] == 5
 
             if USE_ATT_REG:
                 total_att = total_att + att_weights
             if USE_TAG_ATT_REG:
                 total_tag_att = total_tag_att + tag_att_weights
 
-            vector = dy.concatenate([context, tag_context, last_output_embeddings])
-            s = s.add_input(vector)
+            vector = torch.cat([context, tag_context, last_output_embeddings])
+            s_out, (h_n, c_n) = self.dec_lstm(vector.unsqueeze(0), (h_n, c_n))
+            s_out = s_out.squeeze(0)
+            # (B, STATE_SIZE)
+            s_out = torch.dropout(s_out, DROPOUT_PROB, train=True)
 
-            s_out = dy.dropout(s.output(), DROPOUT_PROB)
-
-            out_vector = self.decoder_w * s_out + self.decoder_b
-            probs = dy.softmax(out_vector)
-            if teacher_prob == 1:
+            out_vector = self.decoder(s_out)
+            # (B, VOCAB_SIZE)
+            probs = torch.softmax(out_vector, dim=-1)
+            if teacher_prob == 1.:
                 last_output_embeddings = self.output_lookup[char]
             else:
-                if random() > teacher_prob:
-                    out_char = np.argmax(probs.npvalue())
-                    last_output_embeddings = self.output_lookup[out_char]
-                else:
-                    last_output_embeddings = self.output_lookup[char]
-
-            loss.append(-dy.log(dy.pick(probs, char)))
-        loss = dy.esum(loss) * weight
-
+                raise NotImplementedError()
+            loss.append(-torch.log(probs[char]))
+        loss = sum(loss) * weight
         if PREDICT_LANG:
-            last_enc_state = vectors[-1]
-            adv_state = dy.flip_gradient(last_enc_state)
-            pred_lang = dy.transpose(dy.transpose(adv_state) * self.lang_class_w)
-            lang_probs = dy.softmax(pred_lang)
-            lang_loss_1 = -dy.log(dy.pick(lang_probs, lang_id))
-
-            first_enc_state = vectors[0]
-            adv_state2 = dy.flip_gradient(first_enc_state)
-            pred_lang2 = dy.transpose(dy.transpose(adv_state2) * self.lang_class_w)
-            lang_probs2 = dy.softmax(pred_lang2)
-            lang_loss_2 = -dy.log(dy.pick(lang_probs2, lang_id))
-            loss += lang_loss_1 + lang_loss_2
+            raise NotImplementedError()
 
         if USE_ATT_REG:
-            loss += dy.huber_distance(dy.ones(N), total_att)
+            loss += torch.nn.SmoothL1Loss()(torch.ones((batch_size, N, 1)), total_att)
+
         if USE_TAG_ATT_REG:
-            loss += dy.huber_distance(dy.ones(len(tag_vectors)), total_tag_att)
-
+            loss += torch.nn.SmoothL1Loss()(torch.ones((batch_size, tag_N, 1)), total_tag_att)
         return loss
-
-    def generate(self, in_seq, tag_seq, show_att=False, show_tag_att=False, fn=None):
-        dy.renew_cg()
-        embedded = self.embed_sentence(in_seq)
-        encoded = self.encode_sentence(embedded)
-
-        embedded_tags = self.embed_tags(tag_seq)
-        # encoded_tags = self.encode_tags(embedded_tags)
-        encoded_tags = self.self_encode_tags(embedded_tags)
-
-        input_mat = dy.concatenate_cols(encoded)
-        tag_input_mat = dy.concatenate_cols(encoded_tags)
-        w1dt = None
-        tag_w1dt = None
-
-        prev_att = dy.zeros(5)
-
-        tmpinseq = [EOS] + list(in_seq) + [EOS]
-        N = len(tmpinseq)
-
-        last_output_embeddings = self.output_lookup[char2int[EOS]]
-        s = self.dec_lstm.initial_state().add_input(dy.concatenate([encoded[-1], encoded_tags[-1], last_output_embeddings]))
-
-        out = ''
-        count_EOS = 0
-        if show_att:
-            attt_weights = []
-        if show_tag_att:
-            ttt_weights = []
-        for i in range(len(in_seq) * 2):
-            if count_EOS == 2: break
-            # w1dt can be computed and cached once for the entire decoding phase
-            w1dt = w1dt or self.attention_w1 * input_mat
-            tag_w1dt = tag_w1dt or self.tag_attention_w1 * tag_input_mat
-
-            state = dy.concatenate(list(s.s()))
-            tag_att_weights = self.attend_tags(state, tag_w1dt)
-            tag_context = tag_input_mat * tag_att_weights
-            tag_context2 = dy.concatenate([tag_context, tag_context])
-            new_state = state + tag_context2
-            att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
-            best_ic = np.argmax(att_weights.vec_value())
-            context = input_mat * att_weights
-            startt = min(best_ic - 2, N - 6)
-            if startt < 0:
-                startt = 0
-            endd = startt + 5
-            if N < 5:
-                prev_att = dy.concatenate([att_weights] + [dy.zeros(1)] * (5 - N))
-            else:
-                prev_att = att_weights[startt:endd]
-
-            if show_att:
-                attt_weights.append(att_weights.npvalue())
-            if show_tag_att:
-                ttt_weights.append(tag_att_weights.npvalue())
-
-            vector = dy.concatenate([context, tag_context, last_output_embeddings])
-            s = s.add_input(vector)
-            out_vector = self.decoder_w * s.output() + self.decoder_b
-            probs = dy.softmax(out_vector).npvalue()
-
-            next_char = np.argmax(probs)
-            last_output_embeddings = self.output_lookup[next_char]
-            if int2char[next_char] == EOS:
-                count_EOS += 1
-                continue
-
-            out += int2char[next_char]
-
-        if (show_att) and len(out) and fn is not None:
-            arr = np.squeeze(np.array(attt_weights))[1:-1, 1:-1]
-            fig, ax = plt.subplots()
-            ax = plt.imshow(arr)
-            x_positions = np.arange(0, len(attt_weights[0]) - 2)
-            y_positions = np.arange(0, len(out))
-            plt.xticks(x_positions, list(in_seq))
-            plt.yticks(y_positions, list(out))
-            plt.savefig(fn + '-char.png')
-            plt.clf()
-            plt.close()
-
-        if (show_tag_att) and len(out) and fn is not None:
-            arr = np.squeeze(np.array(ttt_weights))[1:-1, :]
-            fig, ax = plt.subplots()
-            ax = plt.imshow(arr)
-            x_positions = np.arange(0, len(ttt_weights[0]))
-            y_positions = np.arange(0, len(out))
-            plt.xticks(x_positions, list(tag_seq))
-            plt.yticks(y_positions, list(out))
-            plt.savefig(fn + '-tag.png')
-            plt.clf()
-            plt.close()
-
-        return out
-
-    def draw_decode(self, in_seq, tag_seq, out_seq, show_att=False, show_tag_att=False, fn=None):
-        dy.renew_cg()
-        embedded = self.embed_sentence(in_seq)
-        encoded = self.encode_sentence(embedded)
-        N = len(encoded)
-
-        embedded_tags = self.embed_tags(tag_seq)
-        encoded_tags = self.self_encode_tags(embedded_tags)
-
-        output = [EOS] + list(out_seq) + [EOS]
-        output = [char2int[c] for c in output]
-
-        input_mat = dy.concatenate_cols(encoded)
-        w1dt = None
-
-        tag_input_mat = dy.concatenate_cols(encoded_tags)
-        tag_w1dt = None
-
-        last_output_embeddings = self.output_lookup[char2int[EOS]]
-        s = self.dec_lstm.initial_state().add_input(dy.concatenate([encoded[-1], encoded_tags[-1], last_output_embeddings]))
-        prev_att = dy.zeros(5)
-
-        attt_weights = []
-        ttt_weights = []
-
-        for char in output:
-            # w1dt can be computed and cached once for the entire decoding phase
-            w1dt = w1dt or self.attention_w1 * input_mat
-            tag_w1dt = tag_w1dt or self.tag_attention_w1 * tag_input_mat
-
-            state = dy.concatenate(list(s.s()))
-
-            tag_att_weights = self.attend_tags(state, tag_w1dt)
-            tag_context = tag_input_mat * tag_att_weights
-
-            tag_context2 = dy.concatenate([tag_context, tag_context])
-
-            new_state = state + tag_context2
-
-            att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
-            best_ic = np.argmax(att_weights.vec_value())
-            context = input_mat * att_weights
-            startt = min(best_ic - 2, N - 6)
-            if startt < 0:
-                startt = 0
-            endd = startt + 5
-
-            if N < 5:
-                prev_att = dy.concatenate([att_weights] + [dy.zeros(1)] * (5 - N))
-            else:
-                prev_att = att_weights[startt:endd]
-            if prev_att.dim()[0][0] != 5:
-                print(prev_att.dim())
-
-            if show_att:
-                attt_weights.append(att_weights.npvalue())
-            if show_tag_att:
-                ttt_weights.append(tag_att_weights.npvalue())
-
-            vector = dy.concatenate([context, tag_context, last_output_embeddings])
-            s = s.add_input(vector)
-
-            s_out = dy.dropout(s.output(), DROPOUT_PROB)
-
-            out_vector = self.decoder_w * s_out + self.decoder_b
-            probs = dy.softmax(out_vector)
-            last_output_embeddings = self.output_lookup[char]
-
-        outputchars = [int2char[c] for c in output[1:-1]]
-
-        if (show_att) and fn is not None:
-            arr = np.squeeze(np.array(attt_weights))[1:-1, 1:-1]
-            fig, ax = plt.subplots()
-            ax = plt.imshow(arr)
-            x_positions = np.arange(0, len(attt_weights[0]) - 2)
-            y_positions = np.arange(0, len(outputchars))
-            plt.xticks(x_positions, list(in_seq))
-            plt.yticks(y_positions, list(outputchars))
-            plt.savefig(fn + '-char.png')
-            plt.clf()
-            plt.close()
-
-        if (show_tag_att) and fn is not None:
-            arr = np.squeeze(np.array(ttt_weights))[1:-1, :]
-            fig, ax = plt.subplots()
-            ax = plt.imshow(arr)
-            x_positions = np.arange(0, len(ttt_weights[0]))
-            y_positions = np.arange(0, len(outputchars))
-            plt.xticks(x_positions, list(tag_seq))
-            plt.yticks(y_positions, list(outputchars))
-            plt.savefig(fn + '-tag.png')
-            plt.clf()
-            plt.close()
-
-        return
-
-    def generate_nbest(self, in_seq, tag_seq, beam_size=4, show_att=False, show_tag_att=False, fn=None):
-        dy.renew_cg()
-        try:
-            embedded = self.embed_sentence(in_seq)
-        except:
-            return []
-        encoded = self.encode_sentence(embedded)
-
-        embedded_tags = self.embed_tags(tag_seq)
-        # encoded_tags = self.encode_tags(embedded_tags)
-        encoded_tags = self.self_encode_tags(embedded_tags)
-
-        input_mat = dy.concatenate_cols(encoded)
-        tag_input_mat = dy.concatenate_cols(encoded_tags)
-        prev_att = dy.zeros(5)
-
-        tmpinseq = [EOS] + list(in_seq) + [EOS]
-        N = len(tmpinseq)
-
-        last_output_embeddings = self.output_lookup[char2int[EOS]]
-        init_vector = dy.concatenate([encoded[-1], encoded_tags[-1], last_output_embeddings])
-        s_0 = self.dec_lstm.initial_state().add_input(init_vector)
-        w1dt = self.attention_w1 * input_mat
-        tag_w1dt = self.tag_attention_w1 * tag_input_mat
-
-        beam = {0: [(0, s_0.s(), [], prev_att)]}
-
-        i = 1
-
-        nbest = []
-        # we'll need this
-        last_states = {}
-
-        MAX_PREDICTION_LEN = max(len(in_seq) * 1.5, MAX_PREDICTION_LEN_DEF)
-
-        # expand another step if didn't reach max length and there's still beams to expand
-        while i < MAX_PREDICTION_LEN and len(beam[i - 1]) > 0:
-            # create all expansions from the previous beam:
-            next_beam_id = []
-            for hyp_id, hypothesis in enumerate(beam[i - 1]):
-                # expand hypothesis tuple
-                # prefix_seq, prefix_prob, prefix_decoder, prefix_context, prefix_tag_context = hypothesis
-                prefix_prob, prefix_decoder, prefix_seq, prefix_att = hypothesis
-
-                if i > 1:
-                    last_hypo_symbol = prefix_seq[-1]
-                else:
-                    last_hypo_symbol = EOS
-
-                # cant expand finished sequences
-                if last_hypo_symbol == EOS and i > 3:
-                    continue
-                # expand from the last symbol of the hypothesis
-                last_output_embeddings = self.output_lookup[char2int[last_hypo_symbol]]
-
-                # Perform the forward step on the decoder
-                # First, set the decoder's parameters to what they were in the previous step
-                if (i == 1):
-                    s = self.dec_lstm.initial_state().add_input(init_vector)
-                else:
-                    s = self.dec_lstm.initial_state(prefix_decoder)
-
-                state = dy.concatenate(list(s.s()))
-                tag_att_weights = self.attend_tags(state, tag_w1dt)
-                tag_context = tag_input_mat * tag_att_weights
-                tag_context2 = dy.concatenate([tag_context, tag_context])
-                new_state = state + tag_context2
-
-                att_weights = self.attend_with_prev(new_state, w1dt, prefix_att)
-                best_ic = np.argmax(att_weights.vec_value())
-                startt = min(best_ic - 2, N - 6)
-                if startt < 0:
-                    startt = 0
-                endd = startt + 5
-                if N < 5:
-                    prev_att = dy.concatenate([att_weights] + [dy.zeros(1)] * (5 - N))
-                else:
-                    prev_att = att_weights[startt:endd]
-                if prev_att.dim()[0][0] != 5:
-                    print(prev_att.dim())
-                context = input_mat * att_weights
-
-                vector = dy.concatenate([context, tag_context, last_output_embeddings])
-                s_0 = s.add_input(vector)
-                out_vector = self.decoder_w * s_0.output() + self.decoder_b
-                probs = dy.softmax(out_vector).npvalue()
-
-                # Add length norm
-                length_norm = np.power(5 + i, LENGTH_NORM_WEIGHT) / (np.power(6, LENGTH_NORM_WEIGHT))
-                probs = probs / length_norm
-
-                last_states[hyp_id] = s_0.s()
-
-                # find best candidate outputs
-                n_best_indices = myutil.argmax(probs, beam_size)
-                for index in n_best_indices:
-                    this_score = prefix_prob + np.log(probs[index])
-                    next_beam_id.append((this_score, hyp_id, index, prev_att))
-                next_beam_id.sort(key=itemgetter(0), reverse=True)
-                next_beam_id = next_beam_id[:beam_size]
-
-            # Create the most probable hypotheses
-            # add the most probable expansions from all hypotheses to the beam
-            new_hypos = []
-            for item in next_beam_id:
-                hypid = item[1]
-                this_prob = item[0]
-                char_id = item[2]
-                next_sentence = beam[i - 1][hypid][2] + [int2char[char_id]]
-                new_hyp = (this_prob, last_states[hypid], next_sentence, item[3])
-                new_hypos.append(new_hyp)
-                if next_sentence[-1] == EOS or i == MAX_PREDICTION_LEN - 1:
-                    if ''.join(next_sentence) != "<EOS>" and ''.join(next_sentence) != "<EOS><EOS>" and ''.join(
-                            next_sentence) != "<EOS><EOS><EOS>":
-                        nbest.append(new_hyp)
-
-            beam[i] = new_hypos
-            i += 1
-            if len(nbest) > 0:
-                nbest.sort(key=itemgetter(0), reverse=True)
-                nbest = nbest[:beam_size]
-            if len(nbest) == beam_size and (len(new_hypos) == 0 or (nbest[-1][0] >= new_hypos[0][0])):
-                break
-
-        return nbest
-
-    def get_loss(self, input_sentence, input_tags, output_sentence, lang_id, weight=1, tf_prob=1.0):
-        embedded = self.embed_sentence(input_sentence)
-        encoded = self.encode_sentence(embedded)
-        # input is passed through the lemma encoder - which is a bi-lstm
-
-        # encoded = dy.dropout(encoded, DROPOUT_PROB)
-        embedded_tags = self.embed_tags(input_tags)
-        # encoded_tags = self.encode_tags(enc_tag_lstm, embedded_tags)
-        encoded_tags = self.self_encode_tags(embedded_tags)
-
-        return self.decode(encoded, encoded_tags, output_sentence, lang_id, weight, tf_prob)
 
 
 def test_beam(inf_model, beam_size=4, fn=None):
