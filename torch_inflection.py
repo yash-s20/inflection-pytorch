@@ -38,9 +38,7 @@ parser.add_argument("--use_att_reg", help="use attention regularization on the l
                     action="store_true")
 parser.add_argument("--use_tag_att_reg", help="use attention regularization on the tag attention (def: False)",
                     action="store_true")
-parser.add_argument("--dynet-mem", help="set dynet memory", default=800, type=int, required=False)
 parser.add_argument("--seed", help="random seed", default=42, type=int, required=False)
-parser.add_argument("--dynet-autobatch", help="use dynet autobatching (def: 1)", default=1, type=int, required=False)
 parser.add_argument("--optimizer", help="one of torch.optim's optimizers",
                     choices=list(filter(lambda x: x[0] == x[0].upper() and x[0] != "_",
                                         [optimizer for optimizer in dir(torch.optim)])), required=True)
@@ -900,7 +898,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
     prev_edd = prev_edd or 100
     if lang_ids == None:
         lang_ids = np.zeros(len(burnin_pairs))
-
+    # Stage 1
     if not finetune:
         # Learn to copy -- burn in
         MINIBATCH_SIZE = 64
@@ -929,9 +927,9 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 loss = inf_model(*example)
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE:
-                    n += MINIBATCH_SIZE
                     loss = sum(batch) / len(batch)
                     total_loss += loss.item()
+                    n += MINIBATCH_SIZE
                     print(f"Loss: {total_loss / n}", end="\r")
                     loss.backward()
                     trainer.step()
@@ -976,7 +974,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
             if acc > COPY_THRESHOLD:
                 print("Accuracy good enough, breaking")
                 break
-
+        # Stage 2
         # epochs
         # We don't care for the performance on the copy burnin task
         halvings = 0
@@ -1004,7 +1002,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     raise NotImplementedError()
 
             pairs_io = list(filter(lambda x: x != (), map(lambda x: index_task_to_io(*x), train_pairs)))
-
+            n = 0
             for example in data.BatchSampler(pairs_io, 1, drop_last=False):
                 # task 0 is copy input
                 # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
@@ -1022,6 +1020,8 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / weight
                     total_loss += loss.item()
+                    n += MINIBATCH_SIZE
+                    print(f"Loss: {total_loss / n}", end="\r")
                     loss.backward()
                     trainer.step()
                     batch = []
@@ -1096,7 +1096,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     raise NotImplementedError()
 
             pairs_io = list(filter(lambda x: x != (), map(lambda x: index_task_to_io(*x), finetune_pairs)))
-
+            n = 0
             for example in data.BatchSampler(pairs_io, 1, drop_last=False):
                 # task 0 is copy input
                 # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
@@ -1113,6 +1113,8 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / weight
                     total_loss += loss.item()
+                    n += MINIBATCH_SIZE
+                    print(f"Loss: {total_loss / n}", end="\r")
                     loss.backward()
                     trainer.step()
                     batch = []
@@ -1167,7 +1169,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 return inputs[j], tags[j], outputs[j], lang_ids[j]
 
             pairs_io = list(filter(lambda x: x != (), map(lambda x: index_task_to_io(*x), final_finetune_pairs)))
-
+            n = 0
             for example in data.BatchSampler(pairs_io, 1, drop_last=False):
                 # task 0 is copy input
                 # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
@@ -1182,6 +1184,8 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if len(batch) == MINIBATCH_SIZE:
                     loss = sum(batch) / len(batch)
                     total_loss += loss.item()
+                    n += MINIBATCH_SIZE
+                    print(f"Loss: {total_loss / n}", end="\r")
                     loss.backward()
                     trainer.step()
                     batch = []
