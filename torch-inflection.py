@@ -41,6 +41,10 @@ parser.add_argument("--use_tag_att_reg", help="use attention regularization on t
 parser.add_argument("--dynet-mem", help="set dynet memory", default=800, type=int, required=False)
 parser.add_argument("--seed", help="random seed", default=42, type=int, required=False)
 parser.add_argument("--dynet-autobatch", help="use dynet autobatching (def: 1)", default=1, type=int, required=False)
+parser.add_argument("--optimizer", help="one of torch.optim's optimizers",
+                    choices=list(filter(lambda x: x[0] == x[0].upper() and x[0] != "_",
+                                        [optimizer for optimizer in dir(torch.optim)])), required=True)
+parser.add_argument("--lr", type=float, default=0.01)
 
 args = parser.parse_args()
 random.seed(args.seed)
@@ -259,13 +263,13 @@ def compute_mixing_weights(l):
 
 COPY_THRESHOLD = 0.9
 COPY_TASK_PROB = 0.2
-STARTING_LEARNING_RATE = 0.1
+STARTING_LEARNING_RATE = args.lr
 EPOCHS_TO_HALVE = 6
 
 MULTIPLY = 1
 if len(high_i) + len(low_i) < 5000:
     MULTIPLY = 1
-    STARTING_LEARNING_RATE = 0.2
+    STARTING_LEARNING_RATE = 2 * args.lr
     COPY_THRESHOLD = 0.6
     COPY_TASK_PROB = 0.4
     EPOCHS_TO_HALVE = 12
@@ -336,6 +340,9 @@ def run_lstm(init_state, input_vecs):
         out_vector = s.output()
         out_vectors.append(out_vector)
     return out_vectors
+
+
+optimizer_class = getattr(torch.optim, args.optimizer)
 
 
 class InflectionModule(torch.nn.Module):
@@ -486,19 +493,13 @@ class InflectionModule(torch.nn.Module):
         for char in outputs[0]:
             w1dt = w1dt if w1dt is not None else self.attn_w1(input_mat)
             tag_w1dt = tag_w1dt if tag_w1dt is not None else self.tag_attn_w1(tag_input_mat)
-            # print(h_n.shape)
             state = torch.cat((h_n, c_n), dim=-1).squeeze(0)
             tag_att_weights = self.attend_tags(state, tag_w1dt)
-            # print(tag_input_mat.shape)
-            # print(tag_att_weights.shape)
             tag_context = torch.matmul(tag_input_mat.transpose(1, 2), tag_att_weights).squeeze(-1)
             # this was (B, D, L) x (B, L, 1)
             # (B, D)
-            # print(tag_context.shape)
             tag_context2 = torch.cat([tag_context, tag_context], dim=-1)
             # (B, 2D)
-            # print(state.shape)
-            # print(tag_context2.shape)
             new_state = state + tag_context2
 
             att_weights = self.attend_with_prev(new_state, w1dt, prev_att)
@@ -510,11 +511,11 @@ class InflectionModule(torch.nn.Module):
             startt = min(best_ic - 2, N - 6)
             if startt < 0:
                 startt = 0
-            end = startt + 5
+            endd = startt + 5
             if N < 5:
                 prev_att = torch.cat([att_weights] + [torch.zeros((batch_size, 1, 1))] * (5 - N), dim=1)
             else:
-                prev_att = att_weights[:, startt:end]
+                prev_att = att_weights[:, startt:endd]
             prev_att = prev_att.squeeze(-1)
             assert prev_att.shape[1] == 5
 
@@ -531,7 +532,6 @@ class InflectionModule(torch.nn.Module):
 
             out_vector = self.decoder(s_out)
             # (B, VOCAB_SIZE)
-            # print(out_vector.shape)
             probs = torch.softmax(out_vector, dim=-1).squeeze()
             if teacher_prob == 1.:
                 last_output_embeddings = self.output_lookup(torch.tensor([char]))
@@ -890,8 +890,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
     total_final_finetune_pairs = len(finetune_pairs)
 
     learning_rate = STARTING_LEARNING_RATE
-    # trainer = trainer or dy.SimpleSGDTrainer(inf_model.model, learning_rate)
-    trainer = trainer or torch.optim.SGD(inf_model.parameters(), learning_rate)
+    trainer = trainer or optimizer_class(inf_model.parameters(), learning_rate)
     epochs_since_improv = 0
     halvings = 0
     # trainer.set_clip_threshold(-1.0)
@@ -904,12 +903,11 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
 
     if not finetune:
         # Learn to copy -- burn in
-        MINIBATCH_SIZE = 10
+        MINIBATCH_SIZE = 64
         for i in range(100):
             shuffle(burnin_pairs)
             total_loss = 0.0
             batch = []
-            # dy.renew_cg()
             trainer.zero_grad()
 
             def index_task_to_io(j, t):
@@ -919,7 +917,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                     return outputs[j], tags[j], outputs[j], lang_ids[j]
 
             pairs_io = list(map(lambda x: index_task_to_io(*x), burnin_pairs))
-
+            n = 0
             for example in data.BatchSampler(pairs_io, 1, drop_last=False):
                 # task 0 is copy input
                 # loss = inf_model.get_loss(inp, tag, otpt, lang_id)
@@ -928,14 +926,13 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                            list(map(lambda x: x[2], example)),  # output
                            list(map(lambda x: x[3], example)))  # lang_id
                 # print(example)
-                # loss = 0
                 loss = inf_model(*example)
-                # exit(1)
                 batch.append(loss)
                 if len(batch) == MINIBATCH_SIZE:
+                    n += MINIBATCH_SIZE
                     loss = sum(batch) / len(batch)
                     total_loss += loss.item()
-                    print(f"Loss: {loss.item()}", end="\r")
+                    print(f"Loss: {total_loss / n}", end="\r")
                     loss.backward()
                     trainer.step()
                     batch = []
@@ -973,7 +970,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 halvings += 1
                 if halvings == 1:
                     break
-                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
+                trainer = optimizer_class(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if acc > COPY_THRESHOLD:
@@ -1067,7 +1064,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if halvings == 2:
                     break
                 learning_rate = learning_rate / 2
-                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
+                trainer = optimizer_class(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
             if acc > 0.9 and epochs_since_improv == 4:
@@ -1079,7 +1076,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
         MINIBATCH_SIZE = 1
         if learning_rate < 0.05:
             learning_rate = 0.05
-        trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
+        trainer = optimizer_class(inf_model.parameters(), learning_rate)
         halvings = 0
         for i in range(40):
             shuffle(finetune_pairs)
@@ -1155,7 +1152,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if halvings == 2:
                     break
                 learning_rate = learning_rate / 2
-                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
+                trainer = optimizer_class(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
 
@@ -1223,7 +1220,7 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
                 if halvings == 3:
                     break
                 learning_rate = learning_rate / 2
-                trainer = torch.optim.SGD(inf_model.parameters(), learning_rate)
+                trainer = optimizer_class(inf_model.parameters(), learning_rate)
                 epochs_since_improv = 0
                 inf_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
 
