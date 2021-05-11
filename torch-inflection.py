@@ -1,5 +1,6 @@
 import argparse
 import codecs
+import torch
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
@@ -9,8 +10,6 @@ from operator import itemgetter
 import os, sys
 from random import shuffle
 import random
-import logging
-import torch
 import torch.utils.data as data
 
 parser = argparse.ArgumentParser()
@@ -43,10 +42,8 @@ parser.add_argument("--dynet-mem", help="set dynet memory", default=800, type=in
 parser.add_argument("--seed", help="random seed", default=42, type=int, required=False)
 parser.add_argument("--dynet-autobatch", help="use dynet autobatching (def: 1)", default=1, type=int, required=False)
 
-
 args = parser.parse_args()
 random.seed(args.seed)
-
 
 if args.L1:
     L1 = args.L1
@@ -158,6 +155,7 @@ elif L2 == "azeri":
     MAX_PREDICTION_LEN_DEF = 22
 elif L2 == "yiddish":
     MAX_PREDICTION_LEN_DEF = 22
+
 
 LENGTH_NORM_WEIGHT = 0.1
 EXTRA_WEIGHT = 0.3
@@ -509,7 +507,7 @@ class InflectionModule(torch.nn.Module):
             # (B, 2D)
 
             best_ic = torch.argmax(att_weights, dim=1).squeeze().item()
-            startt = min(best_ic - 1, N - 6)
+            startt = min(best_ic - 2, N - 6)
             if startt < 0:
                 startt = 0
             end = startt + 5
@@ -603,7 +601,7 @@ class InflectionModule(torch.nn.Module):
             # (B, 2D)
 
             best_ic = torch.argmax(att_weights, dim=1).squeeze().item()
-            startt = min(best_ic - 1, N - 6)
+            startt = min(best_ic - 2, N - 6)
             if startt < 0:
                 startt = 0
             end = startt + 5

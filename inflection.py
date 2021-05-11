@@ -81,7 +81,6 @@ OUTPUT_DIR = os.path.join(args.outputpath, exp_dir)
 if not os.path.isdir(OUTPUT_DIR):
     os.mkdir(OUTPUT_DIR)
 
-
 TRAIN=False
 TEST = False
 TEST_ENSEMBLE = False
@@ -119,7 +118,6 @@ ONLY_HALL = False
 if args.only_hall:
     ONLY_HALL = True
 
-
 if args.setting == "original":
     ORIGINAL = True
     SWAP = False
@@ -147,7 +145,6 @@ if USE_HALL:
     MODEL_NAME += "hall."
 if ONLY_HALL:
     MODEL_NAME += "hallonly."
-
 
 MAX_PREDICTION_LEN_DEF = 20
 if L2 == "kabardian":
@@ -243,7 +240,6 @@ else:
         lids_1 += [j+1]*len(ti)
     NUM_LANG = len(L1s)+1
 
-
 if SWAP:
     if len(dev_i) < len(low_o):
         N = len(dev_i)
@@ -262,6 +258,7 @@ print("transfer-language", len(high_i), len(high_o), len(high_t))
 print("test-language", len(low_i), len(low_o), len(low_t))
 print("dev", len(dev_i), len(dev_o), len(dev_t))
 print("test", len(test_i), len(test_t))
+
 
 def compute_mixing_weights(l):
     if l == 3:
@@ -291,13 +288,16 @@ if len(high_i)+len(low_i) < 5000:
     COPY_TASK_PROB = 0.4
     EPOCHS_TO_HALVE = 12
 
+
 def get_chars(l):
     flat_list = [char for word in l for char in word]
     return list(set(flat_list))
 
+
 def get_tags(l):
     flat_list = [tag for sublist in l for tag in sublist]
     return list(set(flat_list))
+
 
 EOS = "<EOS>"
 NULL = "<NULL>"
@@ -330,7 +330,6 @@ tag2int = {c:i for i,c in enumerate(tags)}
 
 VOCAB_SIZE = len(characters)
 TAG_VOCAB_SIZE = len(tags)
-
 
 LSTM_NUM_OF_LAYERS = 1
 EMBEDDINGS_SIZE = 32
@@ -384,7 +383,6 @@ class InflectionModel:
 
         if PREDICT_LANG:
             self.lang_class_w = self.model.add_parameters((STATE_SIZE*2, NUM_LANG))
-            #self.lang_class_w = self.model.add_parameters((STATE_SIZE*2, 1))
 
     def embed_tags(self, tags):
         tags = [tag2int[t] for t in tags]
