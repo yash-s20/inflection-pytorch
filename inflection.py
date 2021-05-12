@@ -229,8 +229,9 @@ else:
         test_i, test_t = dev_i, dev_t
     else:
         test_i, test_t = myutil.read_test_data(TEST_PATH)
+    _, test_o, _ = myutil.read_data(TEST_PATH.removesuffix("-covered"))
     high_i, high_o, high_t = [], [], []
-    lids_1 = [0]*len(low_i) 
+    lids_1 = [0]*len(low_i)
     for j,L1 in enumerate(L1s):
         HIGH_PATH = os.path.join(DATA_PATH, L1+ "-train")
         ti, to, tt = myutil.read_data(HIGH_PATH)
@@ -1107,21 +1108,30 @@ def eval_dev_beam_ensemble(inf_models, weights, beam_size=4, K=100, epoch=0):
 
 
 def test_beam(inf_model, beam_size=4, fn=None):
+    K = len(test_i)
     ks = list(range(len(test_i)))
     correct = 0.0
+    outs = []
+    levs = []
     with codecs.open(fn, 'w', 'utf-8') as outf:
         for j,k in enumerate(ks):
             out = inf_model.generate_nbest(test_i[k], test_t[k], beam_size)
             if len(out):
                 word = ''.join([c for c in out[0][2] if c != EOS])
-                out1 = ''.join(out[0][2][1:-1])
             elif out:
                 word = ''.join([c for c in out[0][2] if c != EOS])
             else:
                 word = ''.join(test_i[k])
             outf.write(''.join(test_i[k]) + '\t' + word + '\t' + ';'.join(test_t[k]) + '\n')
+            outs.append(word)
+            lev = myutil.edit_distance(word, test_o[k])
+            levs.append(lev)
+            if list(word) == test_o[k]:
+                correct += 1
 
-    return 
+    accuracy = correct/float(K)
+    avg_edit = np.average(np.array(levs))
+    return accuracy, avg_edit
 
 
 
@@ -1146,7 +1156,6 @@ def eval_dev_beam(inf_model, beam_size=4, K=100, epoch=0):
         out = inf_model.generate_nbest(dev_i[k], dev_t[k], beam_size)
         if len(out):
             word = ''.join([c for c in out[0][2] if c != EOS])
-            out1 = ''.join(out[0][2][1:-1])
         elif out:
             word = ''.join([c for c in out[0][2] if c != EOS])
         else:
@@ -1154,7 +1163,7 @@ def eval_dev_beam(inf_model, beam_size=4, K=100, epoch=0):
         outs.append(word)
         lev = myutil.edit_distance(word, dev_o[k])
         levs.append(lev)
-        if list(out1) == dev_o[k]:
+        if list(word) == dev_o[k]:
             correct += 1
 
     accuracy = correct/float(K)
@@ -1538,9 +1547,11 @@ elif TEST:
     inflection_model = InflectionModel()
     inflection_model.model.populate(os.path.join(MODEL_DIR, MODEL_NAME+"acc.model"))
     if args.outputfile:
-        test_beam(inflection_model, 8, args.outputfile)
+        acc, edd = test_beam(inflection_model, 8, args.outputfile)
     else:
-        test_beam(inflection_model, 8, os.path.join(OUTPUT_DIR,MODEL_NAME+"test.output"))
+        acc, edd = test_beam(inflection_model, 8, os.path.join(OUTPUT_DIR,MODEL_NAME+"test.output"))
+    print("Best test accuracy at test: ", acc)
+    print("Best test lev distance at test: ", edd)
 
 
 elif TEST_ENSEMBLE:
@@ -1585,4 +1596,3 @@ elif TEST_ALL_ENSEMBLE:
     inflection_model4 = InflectionModel()
     inflection_model4.model.populate(os.path.join(MODEL_DIR,"swap.edd.model"))
     test_beam_ensemble([inflection_model1, inflection_model2, inflection_model3, inflection_model4], mixing_weights+mixing_weights, 8, os.path.join(OUTPUT_DIR,"test.all_ensemble.output"))
-    

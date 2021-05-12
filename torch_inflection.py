@@ -17,8 +17,8 @@ parser.add_argument("--datapath", help="path to data", type=str, required=True)
 parser.add_argument("--L1", help="transfer languages (split with comma for multiple ones)", type=str, required=False)
 parser.add_argument("--L2", help="test languages", type=str, required=True)
 parser.add_argument("--mode", help="usage mode", type=str,
-                    choices=['train', 'test',
-                             # 'test-dev', 'draw-dev', 'test-dev-ensemble', 'test-ensemble',
+                    choices=['train', 'test', 'test-dev',
+                             #'draw-dev', 'test-dev-ensemble', 'test-ensemble',
                              # 'test-two-ensemble', 'test-three-ensemble',
                              # 'test-all-ensemble'
                              ],
@@ -105,6 +105,8 @@ if args.mode == "train":
     TRAIN = True
 elif args.mode == "test":
     TEST = True
+elif args.mode == "test-dev":
+    TEST_DEV = True
 
 USE_HALL = False
 if args.use_hall:
@@ -213,6 +215,7 @@ else:
         test_i, test_t = dev_i, dev_t
     else:
         test_i, test_t = myutil.read_test_data(TEST_PATH)
+    _, test_o, _ = myutil.read_data(TEST_PATH.removesuffix("-covered"))
     high_i, high_o, high_t = [], [], []
     lids_1 = [0] * len(low_i)
     for j, L1 in enumerate(L1s):
@@ -805,22 +808,32 @@ class InflectionModule(torch.nn.Module):
     def populate(self, path):
         self.load_state_dict(torch.load(path))
 
+
 def test_beam(inf_model, beam_size=4, fn=None):
-    ks = list(range(len(test_i)))
+    K = len(test_i)
+    ks = list(range(K))
     correct = 0.0
+    outs = []
+    levs = []
     with codecs.open(fn, 'w', 'utf-8') as outf:
         for j, k in enumerate(ks):
             out = inf_model.generate_nbest(test_i[k], test_t[k], beam_size)
             if len(out):
                 word = ''.join([c for c in out[0][2] if c != EOS])
-                out1 = ''.join(out[0][2][1:-1])
             elif out:
                 word = ''.join([c for c in out[0][2] if c != EOS])
             else:
                 word = ''.join(test_i[k])
             outf.write(''.join(test_i[k]) + '\t' + word + '\t' + ';'.join(test_t[k]) + '\n')
+            outs.append(word)
+            lev = myutil.edit_distance(word, test_o[k])
+            levs.append(lev)
+            if list(word) == test_o[k]:
+                correct += 1
 
-    return
+    accuracy = correct/float(K)
+    avg_edit = np.average(np.array(levs))
+    return accuracy, avg_edit
 
 
 def argmaxk(arr, k):
@@ -829,6 +842,7 @@ def argmaxk(arr, k):
     # get k best indices
     indices = indices.flip((0, ))[:k]
     return indices
+
 
 def eval_dev_greedy(inf_model, K=100, epoch=0):
     if K == "all":
@@ -870,6 +884,34 @@ def eval_dev_copy_greedy(inf_model, K=40, epoch=0):
             correct += 1
 
     accuracy = correct / float(K)
+    avg_edit = np.average(np.array(levs))
+    return accuracy, avg_edit
+
+
+def eval_dev_beam(inf_model, beam_size=4, K=100, epoch=0):
+    if K == "all":
+        K = len(dev_i)
+    ks = list(range(len(dev_i)))
+    shuffle(ks)
+    ks = ks[:K]
+    outs = []
+    levs = []
+    correct = 0.0
+    for j,k in enumerate(ks):
+        out = inf_model.generate_nbest(dev_i[k], dev_t[k], beam_size)
+        if len(out):
+            word = ''.join([c for c in out[0][2] if c != EOS])
+        elif out:
+            word = ''.join([c for c in out[0][2] if c != EOS])
+        else:
+            word = ''.join(dev_i[k])
+        outs.append(word)
+        lev = myutil.edit_distance(word, dev_o[k])
+        levs.append(lev)
+        if list(word) == dev_o[k]:
+            correct += 1
+
+    accuracy = correct/float(K)
     avg_edit = np.average(np.array(levs))
     return accuracy, avg_edit
 
@@ -1278,10 +1320,20 @@ if TRAIN:
             print("Best dev accuracy after finetuning: ", best_acc)
             print("Best dev lev distance after finetuning: ", best_edd)
 
+elif TEST_DEV:
+    inflection_model = InflectionModule()
+    inflection_model.populate(os.path.join(MODEL_DIR, MODEL_NAME+"acc.model"))
+    #acc, edd = eval_dev_greedy(enc_fwd_lstm, enc_bwd_lstm, dec_lstm, "all", "test")
+    acc, edd = eval_dev_beam(inflection_model, 8, "all", "test") # it was 8 beams
+    print("Best dev accuracy at test: ", acc)
+    print("Best dev lev distance at test: ", edd)
+
 elif TEST:
     inflection_model = InflectionModule()
     inflection_model.populate(os.path.join(MODEL_DIR, MODEL_NAME + "acc.model"))
     if args.outputfile:
-        test_beam(inflection_model, 8, args.outputfile)
+        acc, edd = test_beam(inflection_model, 8, args.outputfile)
     else:
-        test_beam(inflection_model, 8, os.path.join(OUTPUT_DIR, MODEL_NAME + "test.output"))
+        acc, edd = test_beam(inflection_model, 8, os.path.join(OUTPUT_DIR, MODEL_NAME + "test.output"))
+    print("Best test accuracy at test: ", acc)
+    print("Best test lev distance at test: ", edd)
