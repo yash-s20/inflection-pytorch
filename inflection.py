@@ -3,7 +3,9 @@
 import argparse
 import codecs
 import dynet as dy
-import matplotlib 
+import matplotlib
+from flask import request, render_template, redirect, url_for, Flask
+
 matplotlib.use('agg') 
 import matplotlib.pyplot as plt
 import myutil
@@ -20,7 +22,7 @@ parser.add_argument("--L1", help="transfer languages (split with comma for multi
 parser.add_argument("--L2", help="test languages", type=str, required=True)
 parser.add_argument("--mode", help="usage mode", type=str,
     choices=['train','test','test-dev','draw-dev','test-dev-ensemble','test-ensemble','test-two-ensemble','test-three-ensemble',
-    'test-all-ensemble'], default='', required=True)
+    'test-all-ensemble', 'demo'], default='', required=True)
 parser.add_argument("--setting", help="data setting", type=str, choices=['original','swap','low',], default='original')
 parser.add_argument("--modelpath", help="path to store the models", type=str, default='./models')
 parser.add_argument("--figurepath", help="path to store the output attention figures", type=str, default='./figures')
@@ -90,6 +92,7 @@ TEST_ALL_ENSEMBLE = False
 TEST_DEV = False
 DRAW_DEV = False
 TEST_DEV_ENSEMBLE = False
+DEMO = False
 
 if args.mode == "train":
     TRAIN = True
@@ -109,7 +112,8 @@ elif args.mode == "test-three-ensemble":
     TEST_THREE_ENSEMBLE = True
 elif args.mode == "test-all-ensemble":
     TEST_ALL_ENSEMBLE = True
-
+elif args.mode == "demo":
+    DEMO = True
 USE_HALL = False
 if args.use_hall:
     USE_HALL = True
@@ -357,7 +361,7 @@ def run_lstm(init_state, input_vecs):
 
 
 class InflectionModel:
-    def __init__(self):
+    def __init__(self, vocab_size=VOCAB_SIZE, tag_vocab_size=TAG_VOCAB_SIZE):
         self.model = dy.Model()
 
         self.enc_fwd_lstm = dy.CoupledLSTMBuilder(LSTM_NUM_OF_LAYERS, EMBEDDINGS_SIZE, STATE_SIZE, self.model)
@@ -365,15 +369,15 @@ class InflectionModel:
 
         self.dec_lstm = dy.CoupledLSTMBuilder(LSTM_NUM_OF_LAYERS, STATE_SIZE*3+EMBEDDINGS_SIZE, STATE_SIZE, self.model)
 
-        self.input_lookup = self.model.add_lookup_parameters((VOCAB_SIZE, EMBEDDINGS_SIZE) )
-        self.tag_input_lookup = self.model.add_lookup_parameters((TAG_VOCAB_SIZE, EMBEDDINGS_SIZE) )
+        self.input_lookup = self.model.add_lookup_parameters((vocab_size, EMBEDDINGS_SIZE) )
+        self.tag_input_lookup = self.model.add_lookup_parameters((tag_vocab_size, EMBEDDINGS_SIZE) )
         self.attention_w1 = self.model.add_parameters( (ATTENTION_SIZE, STATE_SIZE*2) )
         self.attention_w2 = self.model.add_parameters( (ATTENTION_SIZE, STATE_SIZE*LSTM_NUM_OF_LAYERS*2) )
         self.attention_w3 = self.model.add_parameters( (ATTENTION_SIZE, 5) )
         self.attention_v = self.model.add_parameters( (1, ATTENTION_SIZE))
 
-        self.decoder_w = self.model.add_parameters( (VOCAB_SIZE, STATE_SIZE))
-        self.decoder_b = self.model.add_parameters( (VOCAB_SIZE))
+        self.decoder_w = self.model.add_parameters( (vocab_size, STATE_SIZE))
+        self.decoder_b = self.model.add_parameters( (vocab_size))
         #output_lookup = model.add_lookup_parameters((VOCAB_SIZE, EMBEDDINGS_SIZE))
         self.output_lookup = self.input_lookup
 
@@ -1477,6 +1481,49 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
 
     return trainer, prev_acc, prev_edd
 
+app = Flask(__name__)
+inflection_model = None
+
+@app.route('/morph', methods=['POST', 'GET'])
+def morph():
+    if request.method == "POST":
+        text = request.form['input_text']
+        text = list(text)
+        print(text)
+        tags = request.form['input_tag']
+        tags = tags.split(';')
+        print(tags)
+        out = inflection_model.generate_nbest(text, tags, beam_size=8)
+        word = ''.join([c for c in out[0][2] if c != EOS])
+        return render_template('morph.html', morph_word=word, input_text=''.join(text),
+                               input_tag=";".join(tags))
+    else:
+        return render_template('morph.html')
+
+
+@app.route('/', methods=['GET', 'POST'])
+def welcome():
+    if request.method == "POST":
+        lp = request.form['lang_pair']
+        # print(lp)
+        characters = myutil.read_vocab(os.path.join(args.modelpath, lp, MODEL_NAME + "char.vocab"))
+        if u' ' not in characters:
+            characters.append(u' ')
+        tags = myutil.read_vocab(os.path.join(args.modelpath, lp, MODEL_NAME + "tag.vocab"))
+        global int2tag, int2char, tag2int, char2int
+        int2char = list(characters)
+        char2int = {c: i for i, c in enumerate(characters)}
+
+        int2tag = list(tags)
+        tag2int = {c: i for i, c in enumerate(tags)}
+        global inflection_model
+        inflection_model = InflectionModel(vocab_size=len(characters), tag_vocab_size=len(tags))
+        inflection_model.model.populate(os.path.join(args.modelpath, lp, MODEL_NAME + "acc.model"))
+        # print(inflection_model)
+        return redirect(url_for('morph'))
+    list_models = os.listdir(args.modelpath)
+    # print(list_models)
+    return render_template('index.html', lang_pairs=list_models)
 
 # equivalent of main
 if TRAIN:
@@ -1596,3 +1643,6 @@ elif TEST_ALL_ENSEMBLE:
     inflection_model4 = InflectionModel()
     inflection_model4.model.populate(os.path.join(MODEL_DIR,"swap.edd.model"))
     test_beam_ensemble([inflection_model1, inflection_model2, inflection_model3, inflection_model4], mixing_weights+mixing_weights, 8, os.path.join(OUTPUT_DIR,"test.all_ensemble.output"))
+elif DEMO:
+    inflection_model = InflectionModel()
+    app.run()

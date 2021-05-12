@@ -2,6 +2,8 @@ import argparse
 import codecs
 import torch
 import matplotlib
+from flask import request, render_template, Flask, redirect, url_for
+
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import myutil
@@ -17,7 +19,7 @@ parser.add_argument("--datapath", help="path to data", type=str, required=True)
 parser.add_argument("--L1", help="transfer languages (split with comma for multiple ones)", type=str, required=False)
 parser.add_argument("--L2", help="test languages", type=str, required=True)
 parser.add_argument("--mode", help="usage mode", type=str,
-                    choices=['train', 'test', 'test-dev',
+                    choices=['train', 'test', 'test-dev', 'demo',
                              #'draw-dev', 'test-dev-ensemble', 'test-ensemble',
                              # 'test-two-ensemble', 'test-three-ensemble',
                              # 'test-all-ensemble'
@@ -100,6 +102,7 @@ TEST_ALL_ENSEMBLE = False
 TEST_DEV = False
 DRAW_DEV = False
 TEST_DEV_ENSEMBLE = False
+DEMO = False
 
 if args.mode == "train":
     TRAIN = True
@@ -107,6 +110,8 @@ elif args.mode == "test":
     TEST = True
 elif args.mode == "test-dev":
     TEST_DEV = True
+elif args.mode == "demo":
+    DEMO = True
 
 USE_HALL = False
 if args.use_hall:
@@ -347,21 +352,21 @@ optimizer_class = getattr(torch.optim, args.optimizer)
 
 
 class InflectionModule(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size=VOCAB_SIZE, tag_vocab_size=TAG_VOCAB_SIZE):
         super().__init__()
         self.enc_blstm = torch.nn.LSTM(input_size=EMBEDDINGS_SIZE, hidden_size=STATE_SIZE,
                                        num_layers=LSTM_NUM_OF_LAYERS, bidirectional=True)
         self.dec_lstm = torch.nn.LSTM(input_size=STATE_SIZE * 3 + EMBEDDINGS_SIZE, hidden_size=STATE_SIZE,
                                       num_layers=LSTM_NUM_OF_LAYERS, bidirectional=False)
         # TODO: embeddings have to add padding_idx if it's added
-        self.input_lookup = torch.nn.Embedding(VOCAB_SIZE, EMBEDDINGS_SIZE)
-        self.tag_input_lookup = torch.nn.Embedding(TAG_VOCAB_SIZE, EMBEDDINGS_SIZE)
+        self.input_lookup = torch.nn.Embedding(vocab_size, EMBEDDINGS_SIZE)
+        self.tag_input_lookup = torch.nn.Embedding(tag_vocab_size, EMBEDDINGS_SIZE)
         self.attn_w1 = torch.nn.Linear(STATE_SIZE * 2, ATTENTION_SIZE, bias=False)
         self.attn_w2 = torch.nn.Linear(STATE_SIZE * 2 * LSTM_NUM_OF_LAYERS, ATTENTION_SIZE, bias=False)
         self.attn_w3 = torch.nn.Linear(5, ATTENTION_SIZE, bias=False)
         self.attn_v = torch.nn.Linear(ATTENTION_SIZE, 1, bias=False)
 
-        self.decoder = torch.nn.Linear(STATE_SIZE, VOCAB_SIZE)
+        self.decoder = torch.nn.Linear(STATE_SIZE, vocab_size)
         self.output_lookup = self.input_lookup
 
         self.enc_tag_lstm = torch.nn.LSTM(input_size=EMBEDDINGS_SIZE, hidden_size=STATE_SIZE,
@@ -663,10 +668,7 @@ class InflectionModule(torch.nn.Module):
 
     @torch.no_grad()
     def generate_nbest(self, in_seq, tag_seq, beam_size=4, show_att=False, show_tag_att=False, fn=None):
-        try:
-            embedded = self.embed_sentence([in_seq])
-        except:
-            return []
+        embedded = self.embed_sentence([in_seq])
         encoded = self.encode_sentence(embedded)
 
         embedded_tags = self.embed_tags([tag_seq])
@@ -1272,6 +1274,50 @@ def train_simple_attention_with_tags(inf_model, inputs, tags, outputs, lang_ids=
 
     return trainer, prev_acc, prev_edd
 
+inflection_model = None
+app = Flask(__name__)
+
+
+@app.route('/morph', methods=['POST', 'GET'])
+def morph():
+    if request.method == "POST":
+        text = request.form['input_text']
+        text = list(text)
+        print(text)
+        tags = request.form['input_tag']
+        tags = tags.split(';')
+        print(tags)
+        out = inflection_model.generate_nbest(text, tags, beam_size=8)
+        word = ''.join([c for c in out[0][2] if c != EOS])
+        return render_template('morph.html', morph_word=word, input_text=''.join(text),
+                               input_tag=";".join(tags))
+    else:
+        return render_template('morph.html')
+
+
+@app.route('/', methods=['GET', 'POST'])
+def welcome():
+    if request.method == "POST":
+        lp = request.form['lang_pair']
+        # print(lp)
+        characters = myutil.read_vocab(os.path.join(args.modelpath, lp, MODEL_NAME + "char.vocab"))
+        if u' ' not in characters:
+            characters.append(u' ')
+        tags = myutil.read_vocab(os.path.join(args.modelpath, lp, MODEL_NAME + "tag.vocab"))
+        global int2tag, int2char, tag2int, char2int
+        int2char = list(characters)
+        char2int = {c: i for i, c in enumerate(characters)}
+
+        int2tag = list(tags)
+        tag2int = {c: i for i, c in enumerate(tags)}
+        global inflection_model
+        inflection_model = InflectionModule(vocab_size=len(characters), tag_vocab_size=len(tags))
+        inflection_model.populate(os.path.join(args.modelpath, lp, MODEL_NAME + "acc.model"))
+        # print(inflection_model)
+        return redirect(url_for('morph'))
+    list_models = os.listdir(args.modelpath)
+    # print(list_models)
+    return render_template('index.html', lang_pairs=list_models)
 
 # equivalent of main
 if TRAIN:
@@ -1337,3 +1383,6 @@ elif TEST:
         acc, edd = test_beam(inflection_model, 8, os.path.join(OUTPUT_DIR, MODEL_NAME + "test.output"))
     print("Best test accuracy at test: ", acc)
     print("Best test lev distance at test: ", edd)
+elif DEMO:
+    inflection_model = InflectionModule()
+    app.run()
