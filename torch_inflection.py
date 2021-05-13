@@ -220,7 +220,7 @@ else:
         test_i, test_t = dev_i, dev_t
     else:
         test_i, test_t = myutil.read_test_data(TEST_PATH)
-    _, test_o, _ = myutil.read_data(TEST_PATH.removesuffix("-covered"))
+    _, test_o, _ = myutil.read_data(TEST_PATH[:-len("-covered")])
     high_i, high_o, high_t = [], [], []
     lids_1 = [0] * len(low_i)
     for j, L1 in enumerate(L1s):
